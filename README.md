@@ -1,7 +1,5 @@
 # KOTOR II Borderless Proxy (dinput8.dll)
 
-<font color="red">
-
 > **Important — restart after every resolution change**  
 > If you change the in-game resolution, edit `swkotor2.ini` resolution, switch monitors, or change `dinput8.ini` settings that affect size or mode, **fully quit and restart the game**. The proxy applies window layout **once** at startup; changing resolution while the game is running will not update correctly and can break rendering or crash later.
 >
@@ -9,8 +7,6 @@
 > Disable **Discord overlay** (including **Legacy Overlay** in Discord settings) and the **Steam in-game overlay** for `swkotor2.exe`.  
 > KOTOR II uses legacy OpenGL; overlays that hook OpenGL can crash after the proxy resizes the window (often `ACCESS_VIOLATION` in `nvoglv32.dll`).  
 > If the game still crashes, check `dinput8.log` next to `swkotor2.exe`.
-
-</font>
 
 ## Description
 
