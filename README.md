@@ -1,5 +1,8 @@
 # KOTOR II Borderless Proxy (dinput8.dll)
 
+> **Important — restart after every resolution change**  
+> If you change the in-game resolution, edit `swkotor2.ini` resolution, switch monitors, or change `dinput8.ini` settings that affect size or mode, **fully quit and restart the game**. The proxy applies window layout **once** at startup; changing resolution while the game is running will not update correctly and can break rendering or crash later.
+>
 > **Important — turn off overlays before playing**  
 > Disable **Discord overlay** (including **Legacy Overlay** in Discord settings) and the **Steam in-game overlay** for `swkotor2.exe`.  
 > KOTOR II uses legacy OpenGL; overlays that hook OpenGL can crash after the proxy resizes the window (often `ACCESS_VIOLATION` in `nvoglv32.dll`).  
@@ -13,7 +16,7 @@ A **32-bit `dinput8.dll` proxy** for *Star Wars: Knights of the Old Republic II*
 - **NoFill** — Stretches the game window to cover the monitor without a black backdrop.
 - **Windowed** — DirectInput proxy only; no window or INI changes.
 
-The proxy waits until the engine’s main window is stable, then applies window changes **once** (no resize loop, no subclassing) to avoid desyncing the OpenGL viewport and crashing the renderer later.
+The proxy waits until the engine’s main window is stable, then applies window changes **once** (no resize loop, no subclassing) to avoid desyncing the OpenGL viewport and crashing the renderer later. **You must restart the game** whenever you change resolution (in-game, in `swkotor2.ini`, or relevant `dinput8.ini` options).
 
 Optional features: hide the taskbar while focused, force windowed mode in `swkotor2.ini`, skip BioWare/Obsidian splash screens (Steam build), and a debug console.
 
@@ -25,8 +28,8 @@ Optional features: hide the taskbar while focused, force windowed mode in `swkot
 2. Copy from the `dist` folder into your KOTOR II game directory (same folder as `swkotor2.exe`):
    - `dinput8.dll`
    - `dinput8.ini`
-3. Edit `dinput8.ini` if you want a different mode or alignment.
-4. Launch the game normally.
+3. Edit `dinput8.ini` if you want a different mode or alignment (restart required after changes — see above).
+4. Launch the game normally. After changing resolution in-game or in `swkotor2.ini`, **exit completely and launch again**.
 
 ### Build from source
 
@@ -68,8 +71,9 @@ SplashScreens=0
 ## Logs and troubleshooting
 
 - **`dinput8.log`** — Written beside `swkotor2.exe` when something goes wrong or logging is enabled.
+- Wrong size, black bars, or glitches after changing resolution → **quit and restart**; do not expect hot-reload.
 - Crashes right after resize → overlays still enabled, or another hook conflicting with OpenGL.
-- Wrong size in NoFill → try `ForceMonitorResolution=1` and confirm `swkotor2.ini` resolution settings.
+- Wrong size in NoFill → try `ForceMonitorResolution=1`, confirm `swkotor2.ini` resolution settings, then **restart**.
 
 ## License
 
