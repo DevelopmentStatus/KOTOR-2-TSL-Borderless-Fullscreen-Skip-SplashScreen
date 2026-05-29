@@ -28,7 +28,7 @@ typedef HRESULT(WINAPI* LPDIRECTINPUT8CREATE)(HINSTANCE, DWORD, REFIID, LPVOID*,
 enum class BorderlessMode {
     Windowed,   // pure pass-through, no window changes
     Fill,       // engine resolution + black borders (fullscreen backdrop)
-    NoFill,     // window stretches to monitor, no black borders
+    NoFill,     // same sizing/placement as Fill, no black backdrop
 };
 
 enum class WindowAlignment {
@@ -47,7 +47,6 @@ static BorderlessMode   g_mode             = BorderlessMode::Fill;
 static WindowAlignment  g_alignment          = WindowAlignment::Centered;
 static bool             g_hideTaskbar        = true;
 static bool             g_forceWindowed      = true;
-static bool             g_forceMonitorRes    = false;
 static bool             g_enableConsole      = false;
 static bool             g_showSplashScreens  = true;
 
@@ -101,12 +100,18 @@ static void RestackFillWindows() {
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
-// When focused, cover the taskbar via HWND_TOPMOST; release on alt-tab.
-static void SetGameAboveTaskbar(bool above) {
-    if (!g_hideTaskbar) return;
+// Fill/NoFill: track foreground so alt-tab can drop the game behind other apps.
+// HideTaskbar=1 additionally raises above the taskbar while focused.
+static bool UsesFocusZOrder() {
+    return g_hideTaskbar || g_mode == BorderlessMode::NoFill;
+}
+
+static void SetGameFocusZOrder(bool gameFocused) {
+    if (!UsesFocusZOrder()) return;
     if (!g_gameHwndForStack || !IsWindow(g_gameHwndForStack)) return;
 
-    const HWND insertAfter = above ? HWND_TOPMOST : HWND_NOTOPMOST;
+    const bool topmost = gameFocused && g_hideTaskbar;
+    const HWND insertAfter = topmost ? HWND_TOPMOST : HWND_NOTOPMOST;
     const UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
 
     if (g_backdropHwnd && IsWindow(g_backdropHwnd)) {
@@ -130,9 +135,9 @@ static VOID CALLBACK ForegroundStackCallback(
 
     SetBreadcrumb("ForegroundStackCallback: entered");
     if (hwnd == g_gameHwndForStack) {
-        SetGameAboveTaskbar(true);
+        SetGameFocusZOrder(true);
     } else if (hwnd != g_backdropHwnd) {
-        SetGameAboveTaskbar(false);
+        SetGameFocusZOrder(false);
     }
     SetBreadcrumb("ForegroundStackCallback: done");
     g_inForegroundCallback.store(false);
@@ -698,32 +703,26 @@ static void WriteDefaultProxyIni() {
         ";             black backdrop fills the monitor around the window\r\n"
         ";             (letterboxing / pillarboxing). Use Alignment to position\r\n"
         ";             the game window on that backdrop.\r\n"
-        ";   NoFill  - Game window covers the monitor; no proxy black backdrop.\r\n"
-        ";             The engine may still render below monitor resolution and\r\n"
-        ";             show its own margin. Use ForceMonitorResolution=1 to match\r\n"
-        ";             native monitor size for a true stretch.\r\n"
+        ";   NoFill  - Same engine resolution and Alignment as Fill, but no black\r\n"
+        ";             backdrop (desktop shows in the letterbox area).\r\n"
         ";   Windowed - Pure pass-through; no window or INI changes.\r\n"
         "Mode=Fill\r\n"
         "\r\n"
-        "; Alignment (Fill mode): where the game window sits on the monitor.\r\n"
+        "; Alignment (Fill / NoFill): where the game window sits on the monitor.\r\n"
         ";   Centered, TopLeft, TopRight, BottomLeft, BottomRight,\r\n"
         ";   Top, Bottom, Left, Right\r\n"
         "Alignment=Centered\r\n"
         "\r\n"
         "; HideTaskbar:\r\n"
-        ";   1 - Keep the game (and Fill-mode backdrop) above the taskbar.\r\n"
-        ";   0 - Leave the desktop and taskbar untouched.\r\n"
+        ";   1 - While focused, keep the game (and Fill backdrop) above the taskbar.\r\n"
+        ";       Alt-tab away releases topmost so other apps can appear on top.\r\n"
+        ";   0 - Leave the taskbar untouched (NoFill still drops behind on alt-tab).\r\n"
         "HideTaskbar=1\r\n"
         "\r\n"
         "; ForceWindowed:\r\n"
         ";   1 - Rewrite swkotor2.ini: FullScreen=0, AllowWindowedMode=1.\r\n"
         ";   0 - Leave swkotor2.ini display mode keys alone.\r\n"
         "ForceWindowed=1\r\n"
-        "\r\n"
-        "; ForceMonitorResolution (NoFill mode only):\r\n"
-        ";   1 - Rewrite swkotor2.ini Width/Height to the monitor size.\r\n"
-        ";   0 - Leave Width/Height alone (use with Fill / in-game options).\r\n"
-        "ForceMonitorResolution=0\r\n"
         "\r\n"
         "; EnableConsole:\r\n"
         ";   1 - Open a debug console (WriteConsole only; does not redirect stdio).\r\n"
@@ -799,9 +798,6 @@ static void LoadProxyConfig() {
     GetPrivateProfileStringW(L"Borderless", L"ForceWindowed", L"1",
                              boolBuf, 16, g_proxyIniPath);
     g_forceWindowed = ParseIniBool(boolBuf);
-    GetPrivateProfileStringW(L"Borderless", L"ForceMonitorResolution", L"1",
-                             boolBuf, 16, g_proxyIniPath);
-    g_forceMonitorRes = ParseIniBool(boolBuf);
     GetPrivateProfileStringW(L"Borderless", L"EnableConsole", L"0",
                              boolBuf, 16, g_proxyIniPath);
     g_enableConsole = ParseIniBool(boolBuf);
@@ -858,10 +854,7 @@ static void RestoreSplashScreens() {
 // Forced (every launch, only when ForceWindowed=1):
 //   - FullScreen=0 / AllowWindowedMode=1
 //
-// Forced (every launch, only when Mode=NoFill AND ForceMonitorResolution=1):
-//   - Width / Height = primary monitor resolution
-//
-// Fill mode never forces resolution: black borders come from keeping the
+// Resolution is never forced: black borders (Fill) come from keeping the
 // engine's chosen render size and painting a backdrop around the window.
 // ---------------------------------------------------------------------------
 static void EnforceGameIniValues() {
@@ -877,19 +870,6 @@ static void EnforceGameIniValues() {
         WritePrivateProfileStringW(L"Graphics Options", L"FullScreen",        L"0", g_gameIniPath);
         WritePrivateProfileStringW(L"Graphics Options", L"AllowWindowedMode", L"1", g_gameIniPath);
         DebugLog("Enforced FullScreen=0 / AllowWindowedMode=1 in swkotor2.ini.");
-    }
-
-    if (g_mode == BorderlessMode::NoFill && g_forceMonitorRes) {
-        wchar_t wBuf[16]{};
-        wchar_t hBuf[16]{};
-        swprintf_s(wBuf, L"%ld", g_monitorWidth);
-        swprintf_s(hBuf, L"%ld", g_monitorHeight);
-        WritePrivateProfileStringW(L"Display Options",  L"Width",  wBuf, g_gameIniPath);
-        WritePrivateProfileStringW(L"Display Options",  L"Height", hBuf, g_gameIniPath);
-        WritePrivateProfileStringW(L"Graphics Options", L"Width",  wBuf, g_gameIniPath);
-        WritePrivateProfileStringW(L"Graphics Options", L"Height", hBuf, g_gameIniPath);
-        DebugLog("Forced engine resolution to %ldx%ld in swkotor2.ini.",
-                 g_monitorWidth, g_monitorHeight);
     }
 }
 
@@ -1200,34 +1180,21 @@ static DWORD WINAPI BorderlessWorker(LPVOID /*lpParam*/) {
     int desiredClientW = g_monitorWidth;
     int desiredClientH = g_monitorHeight;
 
-    if (g_mode == BorderlessMode::Fill) {
-        // Always match the engine's render resolution; black borders come from
-        // the fullscreen backdrop, not from stretching the window frame.
-        if (cw <= 0 || ch <= 0) { cw = 1024; ch = 768; }
-        if (cw > g_monitorWidth)  cw = g_monitorWidth;
-        if (ch > g_monitorHeight) ch = g_monitorHeight;
-        desiredClientW = cw;
-        desiredClientH = ch;
-    } else { // NoFill
-        desiredClientW = g_monitorWidth;
-        desiredClientH = g_monitorHeight;
-        constexpr int kResSlack = 16;
-        if (cw > 0 && ch > 0
-            && (abs(cw - g_monitorWidth) > kResSlack
-                || abs(ch - g_monitorHeight) > kResSlack)) {
-            WorkerLog("nofill", "engine client %dx%d; window stretched to monitor "
-                      "%ldx%ld (engine may still render smaller).",
-                      cw, ch, g_monitorWidth, g_monitorHeight);
-        }
-    }
+    // Fill and NoFill both keep the engine's render resolution and Alignment.
+    // Only Fill creates the fullscreen black backdrop in the letterbox area.
+    if (cw <= 0 || ch <= 0) { cw = 1024; ch = 768; }
+    if (cw > g_monitorWidth)  cw = g_monitorWidth;
+    if (ch > g_monitorHeight) ch = g_monitorHeight;
+    desiredClientW = cw;
+    desiredClientH = ch;
 
     // Fill uses a normal (non-topmost) backdrop so Alt+Tab and other apps can
-    // cover the game. HideTaskbar may let the taskbar peek when unfocused.
+    // cover the game. NoFill uses the same focus hook to drop behind on alt-tab.
     if (g_mode == BorderlessMode::Fill) {
         g_backdropHwnd = CreateBackdropWindow();
     }
 
-    // Strip topmost if the engine had it; Fill/NoFill letterbox must not use it.
+    // Strip topmost if the engine had it; focus hook may re-apply when needed.
     newExStyle &= ~WS_EX_TOPMOST;
 
     int targetX = 0, targetY = 0, targetW = 0, targetH = 0;
@@ -1261,7 +1228,7 @@ static DWORD WINAPI BorderlessWorker(LPVOID /*lpParam*/) {
     }
 
     static HWINEVENTHOOK foregroundHook = NULL;
-    if (!foregroundHook && g_hideTaskbar) {
+    if (!foregroundHook && UsesFocusZOrder()) {
         SetBreadcrumb("BorderlessWorker: installing foreground hook");
         foregroundHook = SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
@@ -1269,15 +1236,15 @@ static DWORD WINAPI BorderlessWorker(LPVOID /*lpParam*/) {
             WINEVENT_OUTOFCONTEXT);
     }
 
-    SetBreadcrumb("BorderlessWorker: before SetGameAboveTaskbar");
-    SetGameAboveTaskbar(GetForegroundWindow() == g_gameHwndForStack);
+    SetBreadcrumb("BorderlessWorker: before SetGameFocusZOrder");
+    SetGameFocusZOrder(GetForegroundWindow() == g_gameHwndForStack);
 
     WorkerLog("done", "apply complete; transitioning to message pump.");
     SetBreadcrumb("BorderlessWorker: before GetMessage");
 
     // Phase 4: message pump for the foreground hook and backdrop repaints.
     // We never touch the game window again from here on.
-    if (g_backdropHwnd || g_hideTaskbar) {
+    if (g_backdropHwnd || UsesFocusZOrder()) {
         MSG msg;
         bool firstDispatch = true;
         while (GetMessageW(&msg, NULL, 0, 0) > 0) {
@@ -1360,16 +1327,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
             DebugLog("dinput8 borderless proxy attached. PID=%lu", GetCurrentProcessId());
             DebugLog("Config: %ls", g_proxyIniPath[0] ? g_proxyIniPath : L"(path unknown)");
             DebugLog("Mode=%d Alignment=%d HideTaskbar=%d ForceWindowed=%d "
-                     "ForceMonitorResolution=%d SplashScreens=%d EnableConsole=1",
+                     "SplashScreens=%d EnableConsole=1",
                      (int)g_mode, (int)g_alignment, (int)g_hideTaskbar,
-                     (int)g_forceWindowed, (int)g_forceMonitorRes,
-                     (int)g_showSplashScreens);
+                     (int)g_forceWindowed, (int)g_showSplashScreens);
             DebugLog("Monitor: %ldx%ld at (%ld,%ld)",
                      g_monitorWidth, g_monitorHeight, g_monitorX, g_monitorY);
         }
 
-        // 3) Rewrite swkotor2.ini (windowed mode + optional forced resolution)
-        //    before the engine reads it in WinMain.
+        // 3) Rewrite swkotor2.ini (windowed mode) before the engine reads it in WinMain.
         EnforceGameIniValues();
 
         // 4) Optionally skip startup splash screens before the engine runs.
