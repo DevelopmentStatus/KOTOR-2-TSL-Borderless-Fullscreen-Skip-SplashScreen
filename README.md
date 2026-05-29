@@ -1,5 +1,7 @@
 # KOTOR II Borderless Proxy (dinput8.dll)
 
+<font color="red">
+
 > **Important — restart after every resolution change**  
 > If you change the in-game resolution, edit `swkotor2.ini` resolution, switch monitors, or change `dinput8.ini` settings that affect size or mode, **fully quit and restart the game**. The proxy applies window layout **once** at startup; changing resolution while the game is running will not update correctly and can break rendering or crash later.
 >
@@ -8,12 +10,14 @@
 > KOTOR II uses legacy OpenGL; overlays that hook OpenGL can crash after the proxy resizes the window (often `ACCESS_VIOLATION` in `nvoglv32.dll`).  
 > If the game still crashes, check `dinput8.log` next to `swkotor2.exe`.
 
+</font>
+
 ## Description
 
 A **32-bit `dinput8.dll` proxy** for *Star Wars: Knights of the Old Republic II* (Steam `swkotor2.exe` build). The game loads this DLL for DirectInput; the proxy forwards input to the real `dinput8.dll` and optionally adjusts the game window for borderless fullscreen on modern monitors.
 
 - **Fill** — Keeps the engine’s configured resolution and adds black letterbox borders on the monitor (centered or aligned).
-- **NoFill** — Stretches the game window to cover the monitor without a black backdrop.
+- **NoFill** — Same engine resolution and alignment as **Fill**, but no black backdrop (desktop shows in the letterbox area).
 - **Windowed** — DirectInput proxy only; no window or INI changes.
 
 The proxy waits until the engine’s main window is stable, then applies window changes **once** (no resize loop, no subclassing) to avoid desyncing the OpenGL viewport and crashing the renderer later. **You must restart the game** whenever you change resolution (in-game, in `swkotor2.ini`, or relevant `dinput8.ini` options).
@@ -47,11 +51,10 @@ All settings live in `[Borderless]` next to `swkotor2.exe`. Legacy mode names ar
 
 | Setting | Values | What it does |
 |--------|--------|----------------|
-| **Mode** | `Fill`, `NoFill`, `Windowed` | **Fill** — engine resolution + black borders on the monitor (letterbox). **NoFill** — window covers the monitor; no proxy black backdrop (engine may still render smaller with its own margin). **Windowed** — pass-through only; no proxy window changes. |
-| **Alignment** | `Centered`, `TopLeft`, `TopRight`, `BottomLeft`, `BottomRight`, `Top`, `Bottom`, `Left`, `Right` | Where the game window sits on the monitor in **Fill** mode (default: `Centered`). |
+| **Mode** | `Fill`, `NoFill`, `Windowed` | **Fill** — engine resolution + black borders on the monitor (letterbox). **NoFill** — same sizing/placement as Fill without the black backdrop. **Windowed** — pass-through only; no proxy window changes. |
+| **Alignment** | `Centered`, `TopLeft`, `TopRight`, `BottomLeft`, `BottomRight`, `Top`, `Bottom`, `Left`, `Right` | Where the game window sits on the monitor in **Fill** / **NoFill** (default: `Centered`). |
 | **HideTaskbar** | `0` or `1` | `1` — while the game has focus, raise the window (and Fill backdrop) above the taskbar; release when you alt-tab away. Fill mode no longer stays topmost when unfocused. |
 | **ForceWindowed** | `0` or `1` | `1` — patch `swkotor2.ini` so the engine starts in windowed mode (needed for borderless behavior). |
-| **ForceMonitorResolution** | `0` or `1` | Only when **Mode=NoFill**. `1` — ask the engine to render at monitor size. |
 | **EnableConsole** | `0` or `1` | `1` — allocate a debug console for proxy logging. Does **not** remove the black backdrop in Fill mode. |
 | **SplashScreens** | `0` or `1` | `1` — show BioWare/Obsidian logo splashes on startup. `0` — skip them (Steam `swkotor2.exe` build only). |
 
@@ -63,7 +66,6 @@ Mode=Fill
 Alignment=Centered
 HideTaskbar=1
 ForceWindowed=1
-ForceMonitorResolution=0
 EnableConsole=0
 SplashScreens=0
 ```
@@ -73,8 +75,8 @@ SplashScreens=0
 - **`dinput8.log`** — Written beside `swkotor2.exe` when something goes wrong or logging is enabled.
 - Wrong size, black bars, or glitches after changing resolution → **quit and restart**; do not expect hot-reload.
 - Crashes right after resize → overlays still enabled, or another hook conflicting with OpenGL.
-- Wrong size in NoFill → try `ForceMonitorResolution=1`, confirm `swkotor2.ini` resolution settings, then **restart**.
+- Wrong size in NoFill → confirm `swkotor2.ini` resolution settings match what you want, then **restart**.
 
 ## License
 
-See repository license. Not affiliated with Lucasfilm, BioWare, Obsidian, or Valve.
+See repository license (if provided). Not affiliated with Lucasfilm, BioWare, Obsidian, or Valve.
