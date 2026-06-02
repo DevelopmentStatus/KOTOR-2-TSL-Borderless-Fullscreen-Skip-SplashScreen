@@ -25,7 +25,6 @@ Optional features: hide the taskbar while focused, automatic windowed-mode and r
 
 <img width="773" height="228" alt="{028A93E8-82D1-426B-BED3-8835D3E03A32}" src="https://github.com/user-attachments/assets/a9051e68-7378-4434-a571-4fe650b5d412" />
 <img width="831" height="155" alt="{E4C5C89C-DE19-40E6-8507-4C2030B36946}" src="https://github.com/user-attachments/assets/8411c639-4b65-484c-b326-48545dcf7625" />
-<img width="698" height="237" alt="{9A2E4993-5736-4B94-89D6-78276460FAC5}" src="https://github.com/user-attachments/assets/72622565-fb09-4968-b867-acc88280fed8" />
 
 ### Pre-built (recommended)
 
