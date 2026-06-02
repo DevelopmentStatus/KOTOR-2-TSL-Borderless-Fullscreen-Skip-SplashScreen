@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <dwmapi.h>
 #include <dbghelp.h>
 #include <tlhelp32.h>
 #include <stdio.h>
@@ -8,6 +9,8 @@
 #include <atomic>
 
 #pragma comment(lib, "dbghelp.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "opengl32.lib")
 
 // dinput8.dll proxy (KOTOR II 32-bit OpenGL build imports DirectInput8Create).
 //
@@ -16,9 +19,6 @@
 // top-level window to be visible AND stable (no style/size changes for ~2s),
 // then performs a single style/position write. We deliberately never re-apply
 // in a loop and never subclass the engine's wndproc: racing the engine's own
-// AdjustWindowRect + SetWindowLong + SetWindowPos sequence desyncs the GL
-// viewport from the actual client rect and crashes the renderer ~15-60s
-// later.
 
 typedef HRESULT(WINAPI* LPDIRECTINPUT8CREATE)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
 
@@ -48,7 +48,14 @@ static WindowAlignment  g_alignment          = WindowAlignment::Centered;
 static bool             g_hideTaskbar        = true;
 static bool             g_forceWindowed      = true;
 static bool             g_enableConsole      = false;
+static bool             g_enableLog          = false;
 static bool             g_showSplashScreens  = true;
+static bool             g_stretchViewport    = true;
+
+// Optional resolution override written into swkotor2.ini before engine init.
+// 0 means "leave the game's existing Width/Height alone" (default behaviour).
+static int              g_forceWidth         = 0;
+static int              g_forceHeight        = 0;
 
 // Detected once at DllMain time from the primary monitor.
 static LONG g_monitorX      = 0;
@@ -74,14 +81,19 @@ static std::atomic<bool>  g_crashHandled{ false };
 static std::atomic<bool>  g_inForegroundCallback{ false };
 
 static char g_lastBreadcrumb[128] = "DllMain: attach";
+static DWORD g_lastBreadcrumbTid = 0;
 
 static HWND g_backdropHwnd = NULL;
 static HWND g_gameHwndForStack = NULL;
+
+// Defined later (logging section); used by the z-order helpers below.
+static void WorkerLog(const char* branch, const char* format, ...);
 
 static void SetBreadcrumb(const char* crumb) {
     if (!crumb || !crumb[0]) return;
     if (g_logLockReady.load()) EnterCriticalSection(&g_logLock);
     strncpy_s(g_lastBreadcrumb, crumb, _TRUNCATE);
+    g_lastBreadcrumbTid = GetCurrentThreadId();
     if (g_logLockReady.load()) LeaveCriticalSection(&g_logLock);
 }
 
@@ -90,6 +102,9 @@ static void SetBreadcrumb(const char* crumb) {
 static void RestackFillWindows() {
     if (!g_gameHwndForStack || !g_backdropHwnd) return;
     if (!IsWindow(g_gameHwndForStack) || !IsWindow(g_backdropHwnd)) return;
+    // STRICT GUARD: If the game isn't the foreground window, do not touch the
+    // backdrop or game Z-order (avoids fighting the WM while tabbed out).
+    if (GetForegroundWindow() != g_gameHwndForStack) return;
 
     SetWindowPos(g_backdropHwnd, NULL,
                  g_monitorX, g_monitorY, g_monitorWidth, g_monitorHeight,
@@ -106,20 +121,41 @@ static bool UsesFocusZOrder() {
     return g_hideTaskbar || g_mode == BorderlessMode::NoFill;
 }
 
+static void ApplyAlignmentToWindow(HWND hwnd, WindowAlignment align);
+static WindowAlignment EffectivePlacementForHwnd(HWND hwnd);
+
 static void SetGameFocusZOrder(bool gameFocused) {
     if (!UsesFocusZOrder()) return;
     if (!g_gameHwndForStack || !IsWindow(g_gameHwndForStack)) return;
 
-    const bool topmost = gameFocused && g_hideTaskbar;
-    const HWND insertAfter = topmost ? HWND_TOPMOST : HWND_NOTOPMOST;
-    const UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+    // Force NOTOPMOST when unfocused so other windows on the same monitor can overlay
+    const HWND insertAfter = (gameFocused && g_hideTaskbar) ? HWND_TOPMOST : HWND_NOTOPMOST;
+    const bool fillMode = g_backdropHwnd && IsWindow(g_backdropHwnd);
 
-    if (g_backdropHwnd && IsWindow(g_backdropHwnd)) {
-        SetWindowPos(g_backdropHwnd, insertAfter, 0, 0, 0, 0, flags);
+    if (fillMode) {
+        UINT backdropFlags = SWP_NOMOVE | SWP_NOSIZE;
+        // Completely HIDE the black backdrop when tabbed out so it doesn't cover other apps
+        backdropFlags |= gameFocused ? (SWP_SHOWWINDOW | SWP_NOACTIVATE) : SWP_HIDEWINDOW;
+        SetWindowPos(g_backdropHwnd, insertAfter, 0, 0, 0, 0, backdropFlags);
     }
-    SetWindowPos(g_gameHwndForStack, insertAfter, 0, 0, 0, 0, flags);
 
-    if (g_backdropHwnd && IsWindow(g_backdropHwnd)) {
+    if (gameFocused) {
+        ApplyAlignmentToWindow(g_gameHwndForStack,
+                               EffectivePlacementForHwnd(g_gameHwndForStack));
+        SetWindowPos(g_gameHwndForStack, insertAfter, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    } else if (fillMode) {
+        // Fill mode: park the game off-screen so the monitor is clear, but keep it
+        // shown so the app stays in the taskbar and alt-tab (unlike SWP_HIDEWINDOW).
+        SetWindowPos(g_gameHwndForStack, insertAfter, -32000, -32000, 0, 0,
+                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    } else {
+        // NoFill: drop topmost only; leave the window on-screen
+        SetWindowPos(g_gameHwndForStack, insertAfter, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+
+    if (gameFocused && fillMode) {
         RestackFillWindows();
     }
 }
@@ -134,26 +170,84 @@ static VOID CALLBACK ForegroundStackCallback(
     if (g_inForegroundCallback.exchange(true)) return;
 
     SetBreadcrumb("ForegroundStackCallback: entered");
-    if (hwnd == g_gameHwndForStack) {
+
+    // Get the actual real-time foreground window to be certain
+    HWND currentForeground = GetForegroundWindow();
+
+    if (currentForeground == g_gameHwndForStack) {
         SetGameFocusZOrder(true);
-    } else if (hwnd != g_backdropHwnd) {
+    } else {
+        // If the new foreground window is anything else, immediately drop topmost
         SetGameFocusZOrder(false);
     }
+
     SetBreadcrumb("ForegroundStackCallback: done");
     g_inForegroundCallback.store(false);
+}
+
+static void RestackFillAfterGameLayoutChange() {
+    if (!g_backdropHwnd || !g_gameHwndForStack) return;
+    if (!IsWindow(g_gameHwndForStack) || !IsWindow(g_backdropHwnd)) return;
+    if (GetForegroundWindow() != g_gameHwndForStack) return;
+
+    RestackFillWindows();
+    if (g_mode == BorderlessMode::Fill) {
+        RedrawWindow(g_backdropHwnd, NULL, NULL,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+    }
+}
+
+static void RefreshFocusZOrderIfGameFocused() {
+    if (!UsesFocusZOrder()) return;
+    if (!g_gameHwndForStack || !IsWindow(g_gameHwndForStack)) return;
+    if (GetForegroundWindow() != g_gameHwndForStack) return;
+    SetGameFocusZOrder(true);
 }
 
 static DWORD WINAPI DelayedRestackThread(LPVOID /*lpParam*/) {
     static const DWORD kDelaysMs[] = { 400, 1200, 3000 };
     for (DWORD delay : kDelaysMs) {
         Sleep(delay);
-        if (!g_backdropHwnd || !g_gameHwndForStack) break;
+
+        if (!g_gameHwndForStack || !IsWindow(g_gameHwndForStack)) break;
+
+        // Alt-tabbed away: don't force topmost over the user's active window.
         if (GetForegroundWindow() != g_gameHwndForStack) continue;
-        RestackFillWindows();
-        RedrawWindow(g_backdropHwnd, NULL, NULL,
-                     RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+
+        if (g_backdropHwnd) {
+            if (!IsWindow(g_backdropHwnd)) break;
+
+            WorkerLog("DelayedRestack", "Enforcing HWND_TOPMOST safety check.");
+            SetGameFocusZOrder(true);
+
+            RestackFillWindows();
+            if (g_mode == BorderlessMode::Fill) {
+                RedrawWindow(g_backdropHwnd, NULL, NULL,
+                             RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+            }
+        } else {
+            RefreshFocusZOrderIfGameFocused();
+        }
     }
     return 0;
+}
+
+// Engine SetWindowPos can reorder the game behind our backdrop/shield or below
+// the taskbar. Re-seat owned helper windows and re-apply focus z-order.
+static VOID CALLBACK GameWindowLayoutCallback(
+    HWINEVENTHOOK /*hook*/, DWORD event, HWND hwnd,
+    LONG idObject, LONG idChild, DWORD /*idEventThread*/, DWORD /*dwmsEventTime*/)
+{
+    if (event != EVENT_OBJECT_LOCATIONCHANGE) return;
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+    if (hwnd != g_gameHwndForStack) return;
+    if (GetForegroundWindow() != g_gameHwndForStack) return;
+
+    if (g_backdropHwnd) {
+        RestackFillAfterGameLayoutChange();
+    } else {
+        RefreshFocusZOrderIfGameFocused();
+    }
 }
 
 struct TargetWindowData {
@@ -165,12 +259,12 @@ struct TargetWindowData {
 // ---------------------------------------------------------------------------
 // Logging.
 //
-// FileLog always appends a timestamped line to dinput8.log in the game folder
-// (independent of EnableConsole) so we have a persistent record + crash trail.
-// DebugLog / WorkerLog additionally echo to the console when EnableConsole=1.
+// When EnableLog=1, FileLog appends timestamped lines to dinput8.log in the
+// game folder (independent of EnableConsole). DebugLog / WorkerLog also echo
+// to the console when EnableConsole=1.
 // ---------------------------------------------------------------------------
 static void FileLogRaw(const char* text) {
-    if (g_logPath[0] == L'\0') return;
+    if (!g_enableLog || g_logPath[0] == L'\0') return;
     const bool lock = g_logLockReady.load();
     if (lock) EnterCriticalSection(&g_logLock);
 
@@ -353,6 +447,32 @@ static void DescribeAddressModule(DWORD_PTR addr, char* out, size_t outSize) {
     _snprintf_s(out, outSize, _TRUNCATE, "%ls+0x%IX", name, off);
 }
 
+// Classify the faulting module so the report makes clear, at a glance, whether
+// the crash originated in our proxy, the engine, or an injected third party
+// (overlays / GPU drivers). KOTOR II is legacy OpenGL; Discord and Steam
+// overlays hook GL entry points and routinely crash inside the GPU driver.
+static const char* DescribeFaultOrigin(const char* faultMod) {
+    if (!faultMod || !faultMod[0]) return nullptr;
+
+    // Matched as a case-insensitive prefix against the faulting module name
+    // ("name.dll+0xoffset"), so entries must be specific enough not to collide.
+    struct Known { const char* prefix; const char* note; };
+    static const Known kKnown[] = {
+        { "discordhook",         "Discord in-game overlay (DiscordHook.dll) - disable the Discord overlay (incl. Legacy Overlay) for swkotor2.exe." },
+        { "gameoverlayrenderer", "Steam in-game overlay (GameOverlayRenderer.dll) - disable the Steam overlay for this title." },
+        { "nvoglv",              "NVIDIA OpenGL driver (nvoglv*.dll) - on this legacy GL game this is almost always an injected overlay hooking GL, not the proxy." },
+        { "atioglxx",            "AMD OpenGL driver - usually an injected overlay hooking GL, not the proxy." },
+        { "dinput8",             "the dinput8 proxy itself." },
+        { "swkotor2",            "the game engine (swkotor2.exe)." },
+    };
+    for (const Known& k : kKnown) {
+        if (_strnicmp(faultMod, k.prefix, strlen(k.prefix)) == 0) {
+            return k.note;
+        }
+    }
+    return nullptr;
+}
+
 static void WriteMiniDump(EXCEPTION_POINTERS* ep, const wchar_t* dumpPath) {
     HANDLE hFile = CreateFileW(dumpPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                                FILE_ATTRIBUTE_NORMAL, NULL);
@@ -486,9 +606,25 @@ static void WriteCrashReport(const char* via, EXCEPTION_POINTERS* ep) {
     FileLog("============================ CRASH =================================");
     FileLog("===================================================================");
     FileLog("Captured via: %s", via ? via : "unknown");
-    FileLog("Last breadcrumb: %s", g_lastBreadcrumb);
+
+    const DWORD crashTid = GetCurrentThreadId();
+    if (g_lastBreadcrumbTid != 0 && g_lastBreadcrumbTid != crashTid) {
+        // The breadcrumb was set by a different thread than the one that
+        // faulted, so it does NOT describe where this crash happened.
+        FileLog("Last breadcrumb: %s  (set by tid:%lu, NOT the faulting "
+                "tid:%lu - breadcrumb is unrelated to this crash)",
+                g_lastBreadcrumb, g_lastBreadcrumbTid, crashTid);
+    } else {
+        FileLog("Last breadcrumb: %s", g_lastBreadcrumb);
+    }
+
     FileLog("Exception: 0x%08lX (%s)", code, ExceptionCodeToString(code));
     FileLog("Fault address: 0x%p  (%s)", (void*)faultAddr, faultMod);
+
+    const char* origin = DescribeFaultOrigin(faultMod);
+    if (origin) {
+        FileLog("Fault origin: %s", origin);
+    }
 
     if (er && code == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
         const char* op = er->ExceptionInformation[0] == 0 ? "read"
@@ -719,15 +855,37 @@ static void WriteDefaultProxyIni() {
         ";   0 - Leave the taskbar untouched (NoFill still drops behind on alt-tab).\r\n"
         "HideTaskbar=1\r\n"
         "\r\n"
+        "; StretchViewport:\r\n"
+        ";   1 - Hook glViewport/glScissor to shift up and extend by top chrome band.\r\n"
+        ";   0 - HWND/DWM fixes only.\r\n"
+        "StretchViewport=1\r\n"
+        "\r\n"
         "; ForceWindowed:\r\n"
         ";   1 - Rewrite swkotor2.ini: FullScreen=0, AllowWindowedMode=1.\r\n"
         ";   0 - Leave swkotor2.ini display mode keys alone.\r\n"
         "ForceWindowed=1\r\n"
         "\r\n"
+        "; Width / Height: force the engine's render resolution by writing these\r\n"
+        "; into swkotor2.ini [Graphics Options] before the game starts. The proxy\r\n"
+        "; keeps whatever the engine renders at, so set the resolution HERE rather\r\n"
+        "; than expecting a borderless window to upscale.\r\n"
+        ";   0    - Leave the game's existing Width/Height alone (default).\r\n"
+        ";   >0   - Force this resolution (e.g. Width=1920 Height=1080).\r\n"
+        "; NOTE: In windowed mode (ForceWindowed=1) the engine may create a smaller\r\n"
+        "; client than Width/Height because of the title bar; the borderless pass\r\n"
+        "; reclaims that space and sizes to the configured render resolution.\r\n"
+        "; Pick a resolution that fits your monitor, e.g. one notch below native.\r\n"
+        "Width=0\r\n"
+        "Height=0\r\n"
+        "\r\n"
+        "; EnableLog:\r\n"
+        ";   1 - Append diagnostics and crash reports to dinput8.log beside the exe.\r\n"
+        ";   0 - No log file (default).\r\n"
+        "EnableLog=0\r\n"
+        "\r\n"
         "; EnableConsole:\r\n"
         ";   1 - Open a debug console (WriteConsole only; does not redirect stdio).\r\n"
         ";   0 - Run silent (recommended for normal play).\r\n"
-        "; Crash reports are always appended to dinput8.log beside the game exe.\r\n"
         "EnableConsole=0\r\n"
         "\r\n"
         "; SplashScreens:\r\n"
@@ -737,7 +895,7 @@ static void WriteDefaultProxyIni() {
         "\r\n"
         "; Overlays: KOTOR II uses legacy OpenGL. Discord (including Legacy Overlay)\r\n"
         "; and Steam in-game overlay hook GL and can crash after borderless changes.\r\n"
-        "; Disable both for swkotor2.exe. See README.txt and dinput8.log if needed.\r\n";
+        "; Disable both for swkotor2.exe. See README.txt; set EnableLog=1 for dinput8.log.\r\n";
 
     HANDLE h = CreateFileW(g_proxyIniPath, GENERIC_WRITE, 0, NULL, CREATE_NEW,
                            FILE_ATTRIBUTE_NORMAL, NULL);
@@ -798,12 +956,23 @@ static void LoadProxyConfig() {
     GetPrivateProfileStringW(L"Borderless", L"ForceWindowed", L"1",
                              boolBuf, 16, g_proxyIniPath);
     g_forceWindowed = ParseIniBool(boolBuf);
+    GetPrivateProfileStringW(L"Borderless", L"EnableLog", L"0",
+                             boolBuf, 16, g_proxyIniPath);
+    g_enableLog = ParseIniBool(boolBuf);
     GetPrivateProfileStringW(L"Borderless", L"EnableConsole", L"0",
                              boolBuf, 16, g_proxyIniPath);
     g_enableConsole = ParseIniBool(boolBuf);
     GetPrivateProfileStringW(L"Borderless", L"SplashScreens", L"1",
                              boolBuf, 16, g_proxyIniPath);
     g_showSplashScreens = ParseIniBool(boolBuf);
+
+    int w = (int)GetPrivateProfileIntW(L"Borderless", L"Width",  0, g_proxyIniPath);
+    int h = (int)GetPrivateProfileIntW(L"Borderless", L"Height", 0, g_proxyIniPath);
+    g_forceWidth  = (w > 0) ? w : 0;
+    g_forceHeight = (h > 0) ? h : 0;
+    GetPrivateProfileStringW(L"Borderless", L"StretchViewport", L"1",
+                             boolBuf, 16, g_proxyIniPath);
+    g_stretchViewport = ParseIniBool(boolBuf);
 }
 
 // ---------------------------------------------------------------------------
@@ -854,8 +1023,10 @@ static void RestoreSplashScreens() {
 // Forced (every launch, only when ForceWindowed=1):
 //   - FullScreen=0 / AllowWindowedMode=1
 //
-// Resolution is never forced: black borders (Fill) come from keeping the
-// engine's chosen render size and painting a backdrop around the window.
+// Resolution is forced only when Width/Height are set in dinput8.ini. The proxy
+// keeps whatever the engine renders at, so the render resolution must be set in
+// swkotor2.ini before the engine reads it in WinMain; we can't enlarge the GL
+// viewport after init without desyncing/crashing the renderer.
 // ---------------------------------------------------------------------------
 static void EnforceGameIniValues() {
     if (g_gameIniPath[0] == L'\0') return;
@@ -871,6 +1042,262 @@ static void EnforceGameIniValues() {
         WritePrivateProfileStringW(L"Graphics Options", L"AllowWindowedMode", L"1", g_gameIniPath);
         DebugLog("Enforced FullScreen=0 / AllowWindowedMode=1 in swkotor2.ini.");
     }
+
+    if (g_forceWidth > 0 && g_forceHeight > 0) {
+        wchar_t wBuf[16], hBuf[16];
+        _snwprintf_s(wBuf, _TRUNCATE, L"%d", g_forceWidth);
+        _snwprintf_s(hBuf, _TRUNCATE, L"%d", g_forceHeight);
+        WritePrivateProfileStringW(L"Graphics Options", L"Width",  wBuf, g_gameIniPath);
+        WritePrivateProfileStringW(L"Graphics Options", L"Height", hBuf, g_gameIniPath);
+        DebugLog("Enforced resolution %dx%d in swkotor2.ini [Graphics Options].",
+                 g_forceWidth, g_forceHeight);
+    }
+}
+
+// Render resolution the engine was told to use (dinput8.ini override or game INI).
+static bool ReadConfiguredRenderSize(int* outW, int* outH) {
+    if (!outW || !outH) return false;
+    *outW = 0;
+    *outH = 0;
+
+    if (g_forceWidth > 0 && g_forceHeight > 0) {
+        *outW = g_forceWidth;
+        *outH = g_forceHeight;
+        return true;
+    }
+
+    if (g_gameIniPath[0] == L'\0') return false;
+    if (GetFileAttributesW(g_gameIniPath) == INVALID_FILE_ATTRIBUTES) return false;
+
+    const int w = (int)GetPrivateProfileIntW(L"Graphics Options", L"Width",  0, g_gameIniPath);
+    const int h = (int)GetPrivateProfileIntW(L"Graphics Options", L"Height", 0, g_gameIniPath);
+    if (w > 0 && h > 0) {
+        *outW = w;
+        *outH = h;
+        return true;
+    }
+    return false;
+}
+
+// After stripping caption/borders, size the client to match the configured render
+// resolution and/or reclaim the non-client pixels we removed (fixes ~34px height
+// loss and letterbox/crop when INI says 1440 but the bordered client was ~1406).
+static void ComputeDesiredClientSize(
+    int currentClientW, int currentClientH,
+    LONG oldStyle, LONG oldExStyle,
+    LONG newStyle, LONG newExStyle,
+    int* outW, int* outH)
+{
+    int desiredW = currentClientW;
+    int desiredH = currentClientH;
+
+    RECT rc{ 0, 0, currentClientW, currentClientH };
+    RECT rcOld = rc;
+    RECT rcNew = rc;
+    AdjustWindowRectEx(&rcOld, oldStyle, FALSE, oldExStyle);
+    AdjustWindowRectEx(&rcNew, newStyle, FALSE, newExStyle);
+    const int reclaimW = (rcOld.right  - rcOld.left) - (rcNew.right  - rcNew.left);
+    const int reclaimH = (rcOld.bottom - rcOld.top)  - (rcNew.bottom - rcNew.top);
+    if (reclaimW > 0) desiredW = currentClientW + reclaimW;
+    if (reclaimH > 0) desiredH = currentClientH + reclaimH;
+
+    int cfgW = 0, cfgH = 0;
+    if (ReadConfiguredRenderSize(&cfgW, &cfgH)) {
+        if (cfgW > desiredW) desiredW = cfgW;
+        if (cfgH > desiredH) desiredH = cfgH;
+    }
+
+    if (desiredW > g_monitorWidth)  desiredW = g_monitorWidth;
+    if (desiredH > g_monitorHeight) desiredH = g_monitorHeight;
+
+    *outW = desiredW;
+    *outH = desiredH;
+}
+
+// Borderless popup: no overlapped frame / DWM caption band in the client.
+static LONG MakeBorderlessPopupStyle(LONG style) {
+    LONG popup = WS_POPUP | WS_VISIBLE;
+    if (style & WS_CLIPSIBLINGS)  popup |= WS_CLIPSIBLINGS;
+    if (style & WS_CLIPCHILDREN) popup |= WS_CLIPCHILDREN;
+    return popup;
+}
+
+static LONG MakeBorderlessPopupExStyle(LONG exStyle) {
+    const LONG kStrip = WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE
+                      | WS_EX_WINDOWEDGE | WS_EX_TOPMOST;
+    return exStyle & ~kStrip;
+}
+
+// Estimated phantom top band (caption + frame) the engine may still reserve.
+static int MeasureTopChromeBandPx(LONG oldStyle, LONG oldExStyle) {
+    RECT rc{ 0, 0, 256, 256 };
+    RECT rcOld = rc;
+    RECT rcPop = rc;
+    AdjustWindowRectEx(&rcOld, oldStyle, FALSE, oldExStyle);
+    AdjustWindowRectEx(&rcPop, WS_POPUP, FALSE, 0);
+    int band = (-rcOld.top) - (-rcPop.top);
+    const int metrics = GetSystemMetrics(SM_CYCAPTION)
+                      + GetSystemMetrics(SM_CYFRAME)
+                      + GetSystemMetrics(SM_CYBORDER);
+    if (metrics > band) band = metrics;
+    return band > 0 ? band : 0;
+}
+
+static void ApplyDwmClientBleed(HWND hwnd) {
+    if (!hwnd) return;
+    const MARGINS margins{ -1, -1, -1, -1 };
+    const HRESULT hr = DwmExtendFrameIntoClientArea(hwnd, &margins);
+    if (FAILED(hr)) {
+        WorkerLog("dwm", "DwmExtendFrameIntoClientArea failed hr=0x%08lX", hr);
+    }
+}
+
+// Pin to monitor top-left when the client fills the monitor (avoids phantom top gap).
+static WindowAlignment EffectivePlacementForClientSize(int clientW, int clientH) {
+    if (clientW >= g_monitorWidth - 1 || clientH >= g_monitorHeight - 1)
+        return WindowAlignment::TopLeft;
+    return g_alignment;
+}
+
+static WindowAlignment EffectivePlacementForHwnd(HWND hwnd) {
+    RECT cr{};
+    if (!GetClientRect(hwnd, &cr)) return g_alignment;
+    const int w = cr.right  - cr.left;
+    const int h = cr.bottom - cr.top;
+    return EffectivePlacementForClientSize(w, h);
+}
+
+// ---------------------------------------------------------------------------
+// OpenGL viewport / scissor hook (StretchY for phantom top title band).
+// ---------------------------------------------------------------------------
+typedef int   GLint;
+typedef int   GLsizei;
+typedef HDC (WINAPI* PFNWGLGETCURRENTDC)(void);
+typedef void (__stdcall* PFNGLVIEWPORTPROC)(GLint x, GLint y, GLsizei width, GLsizei height);
+typedef void (__stdcall* PFNGLSCISSORPROC)(GLint x, GLint y, GLsizei width, GLsizei height);
+
+static std::atomic<bool> g_glHooksInstalled{ false };
+static int               g_glTopBand        = 0;
+static PFNGLVIEWPORTPROC g_realGlViewport     = nullptr;
+static PFNGLSCISSORPROC  g_realGlScissor      = nullptr;
+
+static bool IsGameGlDrawable() {
+    if (!g_gameHwndForStack || g_glTopBand <= 0) return false;
+    const HMODULE gl = GetModuleHandleW(L"opengl32.dll");
+    if (!gl) return false;
+    const auto wglGetCurrentDC =
+        (PFNWGLGETCURRENTDC)GetProcAddress(gl, "wglGetCurrentDC");
+    if (!wglGetCurrentDC) return false;
+    const HDC dc = wglGetCurrentDC();
+    if (!dc) return false;
+    return WindowFromDC(dc) == g_gameHwndForStack;
+}
+
+// Shift viewport/scissor up and extend height by the measured top band (StretchY).
+static void AdjustGlFrameRect(GLint* x, GLint* y, GLsizei* w, GLsizei* h) {
+    if (!IsGameGlDrawable()) return;
+
+    RECT cr{};
+    GetClientRect(g_gameHwndForStack, &cr);
+    const int clientW = cr.right  - cr.left;
+    const int clientH = cr.bottom - cr.top;
+    if (clientW <= 0 || clientH <= 0) return;
+
+    // Only adjust large main-frame rects; skip tiny UI/icon viewports.
+    if (*w < (GLsizei)((clientW * 3) / 4) && *h < (GLsizei)((clientH * 3) / 4))
+        return;
+
+    const int band = g_glTopBand;
+
+    if (*y > 0) {
+        const int expanded = (int)*h + (int)*y;
+        *h = (GLsizei)(expanded > clientH ? clientH : expanded);
+        *y = 0;
+    }
+
+    if ((int)*h > 0) {
+        const int stretched = (int)*h + band;
+        if (stretched <= clientH) {
+            *h = (GLsizei)stretched;
+        } else if ((int)*h < clientH) {
+            *h = (GLsizei)clientH;
+        }
+    }
+}
+
+static void __stdcall Hook_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+    GLint ax = x, ay = y;
+    GLsizei aw = width, ah = height;
+    AdjustGlFrameRect(&ax, &ay, &aw, &ah);
+    if (g_realGlViewport) {
+        g_realGlViewport(ax, ay, aw, ah);
+    }
+}
+
+static void __stdcall Hook_glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
+    GLint ax = x, ay = y;
+    GLsizei aw = width, ah = height;
+    AdjustGlFrameRect(&ax, &ay, &aw, &ah);
+    if (g_realGlScissor) {
+        g_realGlScissor(ax, ay, aw, ah);
+    }
+}
+
+static bool InstallDetour5Byte(void* target, void* hook, void** trampolineOut) {
+    if (!target || !hook || !trampolineOut) return false;
+
+    BYTE* const t = (BYTE*)target;
+    void* const tramp = VirtualAlloc(nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!tramp) return false;
+
+    memcpy(tramp, t, 5);
+    BYTE* const jmpBack = (BYTE*)tramp + 5;
+    jmpBack[0] = 0xE9;
+    *(DWORD*)(jmpBack + 1) = (DWORD)(t + 5) - (DWORD)(jmpBack + 5);
+
+    DWORD oldProt = 0;
+    if (!VirtualProtect(t, 5, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        VirtualFree(tramp, 0, MEM_RELEASE);
+        return false;
+    }
+
+    t[0] = 0xE9;
+    *(DWORD*)(t + 1) = (DWORD)hook - (DWORD)(t + 5);
+    VirtualProtect(t, 5, oldProt, &oldProt);
+    FlushInstructionCache(GetCurrentProcess(), t, 5);
+
+    *trampolineOut = tramp;
+    return true;
+}
+
+static bool InstallOpenGLViewportHooks(int topBand) {
+    if (topBand <= 0 || g_mode == BorderlessMode::Windowed || !g_stretchViewport)
+        return false;
+    if (g_glHooksInstalled.load()) return true;
+
+    g_glTopBand = topBand;
+
+    HMODULE gl = GetModuleHandleW(L"opengl32.dll");
+    if (!gl) gl = LoadLibraryW(L"opengl32.dll");
+    if (!gl) return false;
+
+    void* const pViewport = (void*)GetProcAddress(gl, "glViewport");
+    void* const pScissor  = (void*)GetProcAddress(gl, "glScissor");
+    if (!pViewport) return false;
+
+    void* trampVp = nullptr;
+    if (!InstallDetour5Byte(pViewport, (void*)&Hook_glViewport, &trampVp)) return false;
+    g_realGlViewport = (PFNGLVIEWPORTPROC)trampVp;
+
+    if (pScissor) {
+        void* trampSc = nullptr;
+        if (InstallDetour5Byte(pScissor, (void*)&Hook_glScissor, &trampSc)) {
+            g_realGlScissor = (PFNGLSCISSORPROC)trampSc;
+        }
+    }
+
+    g_glHooksInstalled.store(true);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -884,7 +1311,8 @@ static void EnforceGameIniValues() {
 //   Shell_TrayWnd (topmost, fullscreen) ... but underneath both of ours
 // which is what "taskbar hidden behind the process" requires.
 // ---------------------------------------------------------------------------
-static const wchar_t* kBackdropClassName = L"KOTOR2BorderlessBackdrop";
+static const wchar_t* kBackdropClassName      = L"KOTOR2BorderlessBackdrop";
+static const wchar_t* kTaskbarShieldClassName = L"KOTOR2BorderlessTaskbarShield";
 
 static LRESULT CALLBACK BackdropWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
@@ -913,6 +1341,25 @@ static LRESULT CALLBACK BackdropWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
     return DefWindowProcW(hWnd, msg, w, l);
 }
 
+// NoFill + HideTaskbar: invisible fullscreen layer above the taskbar so the
+// desktop shows through the letterbox while the taskbar stays hidden.
+static LRESULT CALLBACK TaskbarShieldWndProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l) {
+    switch (msg) {
+        case WM_PAINT:
+            ValidateRect(hWnd, NULL);
+            return 0;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_CLOSE:
+            return 0;
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+        case WM_ACTIVATE:
+            return 0;
+    }
+    return DefWindowProcW(hWnd, msg, w, l);
+}
+
 static HWND CreateBackdropWindow() {
     HINSTANCE hInst = GetModuleHandleW(NULL);
 
@@ -928,13 +1375,39 @@ static HWND CreateBackdropWindow() {
     // Intentionally NOT WS_EX_TOPMOST: topmost traps the game above every other
     // app and the backdrop can win the topmost z-order fight on refocus.
     HWND hwnd = CreateWindowExW(
-        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
         kBackdropClassName, L"",
         WS_POPUP,
         g_monitorX, g_monitorY, g_monitorWidth, g_monitorHeight,
         NULL, NULL, hInst, NULL);
 
     if (hwnd) {
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        UpdateWindow(hwnd);
+    }
+    return hwnd;
+}
+
+static HWND CreateTaskbarShieldWindow() {
+    HINSTANCE hInst = GetModuleHandleW(NULL);
+
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = TaskbarShieldWndProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    wc.lpszClassName = kTaskbarShieldClassName;
+    RegisterClassExW(&wc);  // ignore "already registered" errors
+
+    HWND hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+        kTaskbarShieldClassName, L"",
+        WS_POPUP,
+        g_monitorX, g_monitorY, g_monitorWidth, g_monitorHeight,
+        NULL, NULL, hInst, NULL);
+
+    if (hwnd) {
+        SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         UpdateWindow(hwnd);
     }
@@ -950,6 +1423,7 @@ static bool IsExcludedTopLevelWindow(HWND hwnd) {
     // Things we created ourselves; never let them become the cached "game" window.
     if (_stricmp(cls, "ConsoleWindowClass") == 0) return true;
     if (_stricmp(cls, "KOTOR2BorderlessBackdrop") == 0) return true;
+    if (_stricmp(cls, "KOTOR2BorderlessTaskbarShield") == 0) return true;
     return false;
 }
 
@@ -1160,69 +1634,104 @@ static DWORD WINAPI BorderlessWorker(LPVOID /*lpParam*/) {
         WorkerLog("settle", "engine never settled; applying anyway.");
     }
 
-    // Phase 3: one-shot apply.
-    const LONG kStyleStripMask = WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX
-                               | WS_MAXIMIZEBOX | WS_SYSMENU | WS_BORDER
-                               | WS_DLGFRAME;
-    const LONG kExStyleStripMask = WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE
-                                 | WS_EX_STATICEDGE    | WS_EX_WINDOWEDGE;
-
+    // Phase 3: one-shot apply (WS_POPUP + DWM bleed + top-band height fix).
     LONG  style   = GetWindowLongW(gameHwnd, GWL_STYLE);
     LONG  exStyle = GetWindowLongW(gameHwnd, GWL_EXSTYLE);
-    LONG  newStyle   = style   & ~kStyleStripMask;
-    LONG  newExStyle = exStyle & ~kExStyleStripMask;
+    const LONG popupStyle = MakeBorderlessPopupStyle(style);
+    const LONG popupExStyle = MakeBorderlessPopupExStyle(exStyle);
 
     RECT cr{};
     GetClientRect(gameHwnd, &cr);
     int cw = cr.right  - cr.left;
     int ch = cr.bottom - cr.top;
 
-    int desiredClientW = g_monitorWidth;
-    int desiredClientH = g_monitorHeight;
-
-    // Fill and NoFill both keep the engine's render resolution and Alignment.
-    // Only Fill creates the fullscreen black backdrop in the letterbox area.
     if (cw <= 0 || ch <= 0) { cw = 1024; ch = 768; }
-    if (cw > g_monitorWidth)  cw = g_monitorWidth;
-    if (ch > g_monitorHeight) ch = g_monitorHeight;
-    desiredClientW = cw;
-    desiredClientH = ch;
 
-    // Fill uses a normal (non-topmost) backdrop so Alt+Tab and other apps can
-    // cover the game. NoFill uses the same focus hook to drop behind on alt-tab.
-    if (g_mode == BorderlessMode::Fill) {
-        g_backdropHwnd = CreateBackdropWindow();
+    int desiredClientW = 0;
+    int desiredClientH = 0;
+    ComputeDesiredClientSize(cw, ch, style, exStyle, popupStyle, popupExStyle,
+                             &desiredClientW, &desiredClientH);
+
+    const int topBand = MeasureTopChromeBandPx(style, exStyle);
+    if (topBand > 0) {
+        const int expandedH = desiredClientH + topBand;
+        if (expandedH <= g_monitorHeight) {
+            desiredClientH = expandedH;
+        } else if (desiredClientH < g_monitorHeight) {
+            desiredClientH = g_monitorHeight;
+        }
     }
 
-    // Strip topmost if the engine had it; focus hook may re-apply when needed.
-    newExStyle &= ~WS_EX_TOPMOST;
+    const WindowAlignment placement =
+        EffectivePlacementForClientSize(desiredClientW, desiredClientH);
+
+    // Fill and NoFill keep the engine render resolution (from INI / reclaimed
+    // chrome) and Alignment. Only Fill creates the fullscreen black backdrop.
+
+    // Fill uses a black backdrop; NoFill + HideTaskbar uses a transparent shield
+    // above the taskbar so the desktop still shows in the letterbox area.
+    // Both use the same focus hook to drop behind other apps on alt-tab.
+    if (g_mode == BorderlessMode::Fill) {
+        g_backdropHwnd = CreateBackdropWindow();
+    } else if (g_mode == BorderlessMode::NoFill && g_hideTaskbar) {
+        g_backdropHwnd = CreateTaskbarShieldWindow();
+    }
 
     int targetX = 0, targetY = 0, targetW = 0, targetH = 0;
     ComputeAlignedPlacement(desiredClientW, desiredClientH,
-                            newStyle, newExStyle, g_alignment,
+                            popupStyle, popupExStyle, placement,
                             &targetX, &targetY, &targetW, &targetH);
 
-    WorkerLog("apply", "mode=%d align=%d client %dx%d -> outer %dx%d @ (%d,%d) "
-              "backdrop=%p (non-topmost)",
-              (int)g_mode, (int)g_alignment,
+    WorkerLog("apply", "mode=%d align=%d popup=1 topBand=%d engine client %dx%d -> "
+              "target client %dx%d outer %dx%d @ (%d,%d) backdrop=%p",
+              (int)g_mode, (int)placement, topBand, cw, ch,
               desiredClientW, desiredClientH,
               targetW, targetH, targetX, targetY, (void*)g_backdropHwnd);
 
-    SetWindowLongW(gameHwnd, GWL_STYLE,   newStyle);
-    SetWindowLongW(gameHwnd, GWL_EXSTYLE, newExStyle);
+    SetWindowLongW(gameHwnd, GWL_STYLE,   popupStyle);
+    SetWindowLongW(gameHwnd, GWL_EXSTYLE, popupExStyle);
 
     SetWindowPos(gameHwnd, HWND_NOTOPMOST, targetX, targetY, targetW, targetH,
                  SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
 
+    ApplyDwmClientBleed(gameHwnd);
+
     g_gameHwndForStack = gameHwnd;
 
-    ApplyAlignmentToWindow(gameHwnd, g_alignment);
+    ApplyAlignmentToWindow(gameHwnd, placement);
 
+    RECT crAfter{};
+    GetClientRect(gameHwnd, &crAfter);
+    const int actualW = crAfter.right  - crAfter.left;
+    const int actualH = crAfter.bottom - crAfter.top;
+    if (actualW != desiredClientW || actualH != desiredClientH) {
+        WorkerLog("apply", "post-set client %dx%d (wanted %dx%d)",
+                  actualW, actualH, desiredClientW, desiredClientH);
+    }
+
+    if (g_stretchViewport && topBand > 0) {
+        if (InstallOpenGLViewportHooks(topBand)) {
+            WorkerLog("glhook", "glViewport/glScissor hooks active (topBand=%d).",
+                      topBand);
+        } else {
+            WorkerLog("glhook", "failed to install OpenGL hooks (topBand=%d).",
+                      topBand);
+        }
+    }
+
+    static HWINEVENTHOOK layoutHook = NULL;
     if (g_backdropHwnd) {
-        RestackFillWindows();
-        RedrawWindow(g_backdropHwnd, NULL, NULL,
-                     RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+        RestackFillAfterGameLayoutChange();
+    }
 
+    if (!layoutHook && (g_backdropHwnd || UsesFocusZOrder())) {
+        layoutHook = SetWinEventHook(
+            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
+            NULL, GameWindowLayoutCallback, 0, 0,
+            WINEVENT_OUTOFCONTEXT);
+    }
+
+    if (g_backdropHwnd || UsesFocusZOrder()) {
         HANDLE hRestack = CreateThread(NULL, 0, DelayedRestackThread, NULL, 0, NULL);
         if (hRestack) CloseHandle(hRestack);
     }
@@ -1299,8 +1808,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
 
-        // 0) Bring up file logging + the crash handler first, so any fault in
-        //    the engine (or in our own init below) is captured to dinput8.log.
         InitializeCriticalSection(&g_logLock);
         g_logLockReady.store(true);
 
@@ -1310,26 +1817,28 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
         DetectTargetMonitorRect();
         SetBreadcrumb("DllMain: paths detected");
 
-        FileLog("===================================================================");
-        FileLog("dinput8 proxy attached. PID=%lu", GetCurrentProcessId());
-        FileLog("Game folder: %ls", g_exeDir);
-        InstallCrashHandlers();
-
         // 2) Load dinput8.ini (creates a commented default beside the EXE on
-        //    first run) and only allocate a console if the user explicitly
-        //    opted in. Allocating a console on a game that doesn't expect one
-        //    can destabilise its IO and is a likely cause of mysterious
-        //    "crashes after ~30-60s" reports.
+        //    first run) before logging or crash handlers so EnableLog is known.
         LoadProxyConfig();
 
+        if (g_enableLog) {
+            FileLog("===================================================================");
+            FileLog("dinput8 proxy attached. PID=%lu", GetCurrentProcessId());
+            FileLog("Game folder: %ls", g_exeDir);
+            InstallCrashHandlers();
+        }
+
         if (g_enableConsole) {
+            // Only allocate a console when the user explicitly opted in.
+            // Allocating one on a game that doesn't expect it can destabilise IO.
             InitDebugConsole();
             DebugLog("dinput8 borderless proxy attached. PID=%lu", GetCurrentProcessId());
             DebugLog("Config: %ls", g_proxyIniPath[0] ? g_proxyIniPath : L"(path unknown)");
             DebugLog("Mode=%d Alignment=%d HideTaskbar=%d ForceWindowed=%d "
-                     "SplashScreens=%d EnableConsole=1",
+                     "StretchViewport=%d SplashScreens=%d EnableLog=%d EnableConsole=1",
                      (int)g_mode, (int)g_alignment, (int)g_hideTaskbar,
-                     (int)g_forceWindowed, (int)g_showSplashScreens);
+                     (int)g_forceWindowed, (int)g_stretchViewport,
+                     (int)g_showSplashScreens, (int)g_enableLog);
             DebugLog("Monitor: %ldx%ld at (%ld,%ld)",
                      g_monitorWidth, g_monitorHeight, g_monitorX, g_monitorY);
         }
@@ -1349,18 +1858,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
     } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
         RestoreSplashScreens();
 
-        if (!g_crashHandled.load()) {
-            DWORD exitCode = 0;
-            GetExitCodeProcess(GetCurrentProcess(), &exitCode);
-            FileLog("Process detach without prior crash report. PID=%lu "
-                    "Last breadcrumb: %s  Process exit code: %lu",
-                    GetCurrentProcessId(), g_lastBreadcrumb, exitCode);
-        } else {
-            FileLog("dinput8 proxy detaching after crash report. PID=%lu",
-                    GetCurrentProcessId());
+        if (g_enableLog) {
+            if (!g_crashHandled.load()) {
+                DWORD exitCode = 0;
+                GetExitCodeProcess(GetCurrentProcess(), &exitCode);
+                FileLog("Process detach without prior crash report. PID=%lu "
+                        "Last breadcrumb: %s  Process exit code: %lu",
+                        GetCurrentProcessId(), g_lastBreadcrumb, exitCode);
+            } else {
+                FileLog("dinput8 proxy detaching after crash report. PID=%lu",
+                        GetCurrentProcessId());
+            }
+            UninstallCrashHandlers();
         }
-
-        UninstallCrashHandlers();
         if (g_logLockReady.exchange(false)) {
             DeleteCriticalSection(&g_logLock);
         }
