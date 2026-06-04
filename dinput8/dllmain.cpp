@@ -86,31 +86,116 @@ static DWORD g_lastBreadcrumbTid = 0;
 static HWND g_backdropHwnd = NULL;
 static HWND g_gameHwndForStack = NULL;
 
+// Saved after the one-shot borderless apply; used to undo engine FMV window shrinks.
+static int              g_targetClientW     = 0;
+static int              g_targetClientH     = 0;
+static WindowAlignment  g_targetPlacement   = WindowAlignment::Centered;
+static LONG             g_targetPopupStyle  = 0;
+static LONG             g_targetPopupExStyle = 0;
+static std::atomic<bool> g_targetLayoutSaved{ false };
+static std::atomic<bool> g_inLayoutRestore{ false };
+static std::atomic<int>  g_engineShrunkW{ 0 };
+static std::atomic<int>  g_engineShrunkH{ 0 };
+static std::atomic<DWORD> g_lastFmvShrinkMs{ 0 };
+
 // Defined later (logging section); used by the z-order helpers below.
 static void WorkerLog(const char* branch, const char* format, ...);
+static bool IsEngineFmvActive();
+static void EnsureFillBackdropStacked();
+static void HideFillBackdrop();
+static void UpdateFillBackdropForSession();
 
 static void SetBreadcrumb(const char* crumb) {
     if (!crumb || !crumb[0]) return;
-    if (g_logLockReady.load()) EnterCriticalSection(&g_logLock);
+    const bool lock = g_logLockReady.load();
+    if (lock) EnterCriticalSection(&g_logLock);
     strncpy_s(g_lastBreadcrumb, crumb, _TRUNCATE);
     g_lastBreadcrumbTid = GetCurrentThreadId();
-    if (g_logLockReady.load()) LeaveCriticalSection(&g_logLock);
+    if (lock) LeaveCriticalSection(&g_logLock);
 }
 
-// Re-seat the Fill-mode backdrop behind the game. Only touches the backdrop
-// window we own; never moves or resizes the game HWND after the one-shot apply.
+static bool IsForeignAppForeground() {
+    const HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    if (fg == g_gameHwndForStack) return false;
+    DWORD fgPid = 0;
+    GetWindowThreadProcessId(fg, &fgPid);
+    return fgPid != GetCurrentProcessId();
+}
+
+// Not alt-tabbed to another app (Chrome, etc.) — same "session" as the game process.
+static bool IsGameSessionActive() {
+    if (!g_gameHwndForStack || !IsWindow(g_gameHwndForStack)) return false;
+    if (IsIconic(g_gameHwndForStack)) return false;
+    return !IsForeignAppForeground();
+}
+
+// Fill letterbox: same visibility as the game whenever the session is active.
+static bool ShouldShowFillBackdrop() {
+    if (g_mode != BorderlessMode::Fill) return false;
+    if (!g_backdropHwnd || !IsWindow(g_backdropHwnd)) return false;
+    return IsGameSessionActive();
+}
+
+static void HideFillBackdrop() {
+    if (!g_backdropHwnd || !IsWindow(g_backdropHwnd)) return;
+    ShowWindow(g_backdropHwnd, SW_HIDE);
+}
+
+// Fill mode: monitor-sized black layer stacked directly under the game.
+static void EnsureFillBackdropStacked() {
+    if (g_mode != BorderlessMode::Fill) return;
+    if (!g_backdropHwnd || !IsWindow(g_backdropHwnd)) return;
+    if (!g_gameHwndForStack || !IsWindow(g_gameHwndForStack)) return;
+    if (IsIconic(g_gameHwndForStack)) return;
+    if (!ShouldShowFillBackdrop()) {
+        HideFillBackdrop();
+        return;
+    }
+
+    SetWindowPos(g_backdropHwnd, NULL,
+                 g_monitorX, g_monitorY, g_monitorWidth, g_monitorHeight,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+    // hWndInsertAfter = game HWND → backdrop sits behind the game.
+    SetWindowPos(g_backdropHwnd, g_gameHwndForStack, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+    RedrawWindow(g_backdropHwnd, NULL, NULL,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+}
+
+static void UpdateFillBackdropForSession() {
+    if (ShouldShowFillBackdrop())
+        EnsureFillBackdropStacked();
+    else
+        HideFillBackdrop();
+}
+
+// Alt-tab / foreign app: hide Fill backdrop and sink the game below normal windows.
+static void ApplyUnfocusedGamePlacement() {
+    HideFillBackdrop();
+    if (!g_gameHwndForStack || !IsWindow(g_gameHwndForStack)) return;
+    if (IsIconic(g_gameHwndForStack)) return;
+    SetWindowPos(g_gameHwndForStack, HWND_BOTTOM, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+// Re-seat helper backdrop (NoFill taskbar shield) behind the game.
 static void RestackFillWindows() {
     if (!g_gameHwndForStack || !g_backdropHwnd) return;
     if (!IsWindow(g_gameHwndForStack) || !IsWindow(g_backdropHwnd)) return;
-    // STRICT GUARD: If the game isn't the foreground window, do not touch the
-    // backdrop or game Z-order (avoids fighting the WM while tabbed out).
+    if (IsIconic(g_gameHwndForStack)) return;
+    if (g_mode == BorderlessMode::Fill) {
+        UpdateFillBackdropForSession();
+        return;
+    }
     if (GetForegroundWindow() != g_gameHwndForStack) return;
 
     SetWindowPos(g_backdropHwnd, NULL,
                  g_monitorX, g_monitorY, g_monitorWidth, g_monitorHeight,
                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
 
-    // A real HWND in hWndInsertAfter means "place hWnd behind this window".
     SetWindowPos(g_backdropHwnd, g_gameHwndForStack, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
@@ -123,41 +208,95 @@ static bool UsesFocusZOrder() {
 
 static void ApplyAlignmentToWindow(HWND hwnd, WindowAlignment align);
 static WindowAlignment EffectivePlacementForHwnd(HWND hwnd);
+static void ComputeAlignedPlacement(
+    int desiredClientW, int desiredClientH,
+    LONG style, LONG exStyle,
+    WindowAlignment align,
+    int* outX, int* outY, int* outOuterW, int* outOuterH);
+static void RestoreGameClientLayoutIfNeeded();
+
+// True for a short window after the engine shrinks the HWND for Bink FMV.
+// We only use a timestamp (not "client smaller than target") so a resolution
+// mismatch cannot block alt-tab forever.
+static bool IsEngineFmvActive() {
+    const DWORD lastMs = g_lastFmvShrinkMs.load();
+    if (lastMs == 0) return false;
+    return (GetTickCount() - lastMs) < 20000;
+}
 
 static void SetGameFocusZOrder(bool gameFocused) {
-    if (!UsesFocusZOrder()) return;
     if (!g_gameHwndForStack || !IsWindow(g_gameHwndForStack)) return;
 
-    // Force NOTOPMOST when unfocused so other windows on the same monitor can overlay
-    const HWND insertAfter = (gameFocused && g_hideTaskbar) ? HWND_TOPMOST : HWND_NOTOPMOST;
-    const bool fillMode = g_backdropHwnd && IsWindow(g_backdropHwnd);
-
-    if (fillMode) {
-        UINT backdropFlags = SWP_NOMOVE | SWP_NOSIZE;
-        // Completely HIDE the black backdrop when tabbed out so it doesn't cover other apps
-        backdropFlags |= gameFocused ? (SWP_SHOWWINDOW | SWP_NOACTIVATE) : SWP_HIDEWINDOW;
-        SetWindowPos(g_backdropHwnd, insertAfter, 0, 0, 0, 0, backdropFlags);
+    if (!IsGameSessionActive()) {
+        ApplyUnfocusedGamePlacement();
+        return;
     }
 
-    if (gameFocused) {
+    // Backdrop tracks the game whenever we're not alt-tabbed out (incl. Bink FMV).
+    if (g_mode == BorderlessMode::Fill) {
+        EnsureFillBackdropStacked();
+    }
+
+    const bool fgIsGame = GetForegroundWindow() == g_gameHwndForStack;
+    const bool raiseGame =
+        gameFocused && (fgIsGame || IsEngineFmvActive());
+
+    if (!raiseGame) {
+        // In-process FMV / WM foreground glitch: keep backdrop, don't HWND_BOTTOM.
+        if (IsEngineFmvActive()) {
+            RestoreGameClientLayoutIfNeeded();
+        }
+        if (UsesFocusZOrder()) {
+            SetWindowPos(g_gameHwndForStack, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+        if (g_mode == BorderlessMode::Fill) {
+            EnsureFillBackdropStacked();
+        }
+        return;
+    }
+
+    const bool fmvActive = IsEngineFmvActive();
+    const HWND insertAfter = g_hideTaskbar ? HWND_TOPMOST : HWND_NOTOPMOST;
+
+    if (IsIconic(g_gameHwndForStack)) {
+        ShowWindow(g_gameHwndForStack, SW_RESTORE);
+    }
+    if (fmvActive) {
+        RestoreGameClientLayoutIfNeeded();
+    }
+
+    if (UsesFocusZOrder()) {
         ApplyAlignmentToWindow(g_gameHwndForStack,
                                EffectivePlacementForHwnd(g_gameHwndForStack));
         SetWindowPos(g_gameHwndForStack, insertAfter, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-    } else if (fillMode) {
-        // Fill mode: park the game off-screen so the monitor is clear, but keep it
-        // shown so the app stays in the taskbar and alt-tab (unlike SWP_HIDEWINDOW).
-        SetWindowPos(g_gameHwndForStack, insertAfter, -32000, -32000, 0, 0,
-                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    } else {
-        // NoFill: drop topmost only; leave the window on-screen
-        SetWindowPos(g_gameHwndForStack, insertAfter, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
 
-    if (gameFocused && fillMode) {
-        RestackFillWindows();
+    if (g_mode == BorderlessMode::Fill) {
+        EnsureFillBackdropStacked();
     }
+}
+
+// Another app was minimized; the shell may briefly assign foreground to our still-
+// visible game HWND before we finish minimizing on alt-tab.
+static std::atomic<DWORD> g_lastForeignMinimizeMs{ 0 };
+
+static VOID CALLBACK MinimizeStackCallback(
+    HWINEVENTHOOK /*hook*/, DWORD event, HWND hwnd,
+    LONG idObject, LONG idChild, DWORD /*idEventThread*/, DWORD /*dwmsEventTime*/)
+{
+    if (event != EVENT_SYSTEM_MINIMIZESTART) return;
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+    if (!hwnd || hwnd == g_gameHwndForStack) return;
+    g_lastForeignMinimizeMs.store(GetTickCount());
+}
+
+static bool IsSpuriousForegroundAfterForeignMinimize() {
+    const DWORD lastMs = g_lastForeignMinimizeMs.load();
+    if (lastMs == 0) return false;
+    const DWORD elapsed = GetTickCount() - lastMs;
+    return elapsed < 800;
 }
 
 static VOID CALLBACK ForegroundStackCallback(
@@ -175,9 +314,17 @@ static VOID CALLBACK ForegroundStackCallback(
     HWND currentForeground = GetForegroundWindow();
 
     if (currentForeground == g_gameHwndForStack) {
-        SetGameFocusZOrder(true);
+        if (IsSpuriousForegroundAfterForeignMinimize() && !IsEngineFmvActive()) {
+            WorkerLog("focus", "ignore spurious foreground after foreign minimize");
+            ApplyUnfocusedGamePlacement();
+            ShowWindow(g_gameHwndForStack, SW_MINIMIZE);
+        } else {
+            SetGameFocusZOrder(true);
+        }
+    } else if (IsForeignAppForeground()) {
+        SetGameFocusZOrder(false);
     } else {
-        // If the new foreground window is anything else, immediately drop topmost
+        // Bink / same process, non-game foreground HWND — refresh backdrop, no sink.
         SetGameFocusZOrder(false);
     }
 
@@ -188,18 +335,21 @@ static VOID CALLBACK ForegroundStackCallback(
 static void RestackFillAfterGameLayoutChange() {
     if (!g_backdropHwnd || !g_gameHwndForStack) return;
     if (!IsWindow(g_gameHwndForStack) || !IsWindow(g_backdropHwnd)) return;
-    if (GetForegroundWindow() != g_gameHwndForStack) return;
+    if (IsIconic(g_gameHwndForStack)) return;
 
-    RestackFillWindows();
     if (g_mode == BorderlessMode::Fill) {
-        RedrawWindow(g_backdropHwnd, NULL, NULL,
-                     RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+        UpdateFillBackdropForSession();
+        return;
     }
+
+    if (GetForegroundWindow() != g_gameHwndForStack) return;
+    RestackFillWindows();
 }
 
 static void RefreshFocusZOrderIfGameFocused() {
     if (!UsesFocusZOrder()) return;
     if (!g_gameHwndForStack || !IsWindow(g_gameHwndForStack)) return;
+    if (IsIconic(g_gameHwndForStack)) return;
     if (GetForegroundWindow() != g_gameHwndForStack) return;
     SetGameFocusZOrder(true);
 }
@@ -211,19 +361,18 @@ static DWORD WINAPI DelayedRestackThread(LPVOID /*lpParam*/) {
 
         if (!g_gameHwndForStack || !IsWindow(g_gameHwndForStack)) break;
 
-        // Alt-tabbed away: don't force topmost over the user's active window.
-        if (GetForegroundWindow() != g_gameHwndForStack) continue;
+        if (IsIconic(g_gameHwndForStack)) continue;
 
         if (g_backdropHwnd) {
             if (!IsWindow(g_backdropHwnd)) break;
 
-            WorkerLog("DelayedRestack", "Enforcing HWND_TOPMOST safety check.");
-            SetGameFocusZOrder(true);
+            if (!IsGameSessionActive()) continue;
 
-            RestackFillWindows();
-            if (g_mode == BorderlessMode::Fill) {
-                RedrawWindow(g_backdropHwnd, NULL, NULL,
-                             RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+            if (GetForegroundWindow() == g_gameHwndForStack) {
+                WorkerLog("DelayedRestack", "Enforcing HWND_TOPMOST safety check.");
+                SetGameFocusZOrder(true);
+            } else if (g_mode == BorderlessMode::Fill) {
+                SetGameFocusZOrder(false);
             }
         } else {
             RefreshFocusZOrderIfGameFocused();
@@ -241,7 +390,11 @@ static VOID CALLBACK GameWindowLayoutCallback(
     if (event != EVENT_OBJECT_LOCATIONCHANGE) return;
     if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
     if (hwnd != g_gameHwndForStack) return;
-    if (GetForegroundWindow() != g_gameHwndForStack) return;
+
+    if (IsIconic(g_gameHwndForStack) && !IsEngineFmvActive()) return;
+    if (!IsGameSessionActive()) return;
+
+    RestoreGameClientLayoutIfNeeded();
 
     if (g_backdropHwnd) {
         RestackFillAfterGameLayoutChange();
@@ -264,7 +417,6 @@ struct TargetWindowData {
 // to the console when EnableConsole=1.
 // ---------------------------------------------------------------------------
 static void FileLogRaw(const char* text) {
-    if (!g_enableLog || g_logPath[0] == L'\0') return;
     const bool lock = g_logLockReady.load();
     if (lock) EnterCriticalSection(&g_logLock);
 
@@ -272,7 +424,6 @@ static void FileLogRaw(const char* text) {
                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
-        SetFilePointer(h, 0, NULL, FILE_END);
         DWORD written = 0;
         WriteFile(h, text, (DWORD)strlen(text), &written, NULL);
         CloseHandle(h);
@@ -281,78 +432,55 @@ static void FileLogRaw(const char* text) {
     if (lock) LeaveCriticalSection(&g_logLock);
 }
 
-static void FileLogV(const char* tag, const char* format, va_list args) {
-    SYSTEMTIME st{};
-    GetLocalTime(&st);
+static void LogInternal(const char* tag, const char* consolePrefix, const char* format, va_list args) {
+    char msg[2048];
+    int msgLen = _vsnprintf_s(msg, sizeof(msg), _TRUNCATE, format, args);
+    if (msgLen < 0) return;
 
-    char line[2048];
-    int n = _snprintf_s(line, sizeof(line), _TRUNCATE,
-                        "[%04d-%02d-%02d %02d:%02d:%02d.%03d][pid:%lu][tid:%lu]%s ",
-                        st.wYear, st.wMonth, st.wDay,
-                        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-                        GetCurrentProcessId(), GetCurrentThreadId(),
-                        tag ? tag : "");
-    if (n < 0) n = 0;
-
-    if (format) {
-        int m = _vsnprintf_s(line + n, sizeof(line) - n, _TRUNCATE, format, args);
-        if (m > 0) n += m;
+    if (g_enableLog && g_logPath[0] != L'\0') {
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        char line[4096];
+        int n = _snprintf_s(line, sizeof(line), _TRUNCATE,
+                            "[%04d-%02d-%02d %02d:%02d:%02d.%03d][pid:%lu][tid:%lu]%s %s\r\n",
+                            st.wYear, st.wMonth, st.wDay,
+                            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                            GetCurrentProcessId(), GetCurrentThreadId(),
+                            tag ? tag : "", msg);
+        if (n > 0) {
+            FileLogRaw(line);
+        }
     }
-    if (n > (int)sizeof(line) - 3) n = (int)sizeof(line) - 3;
-    line[n++] = '\r';
-    line[n++] = '\n';
-    line[n]   = '\0';
 
-    FileLogRaw(line);
+    if (g_enableConsole && consolePrefix) {
+        char line[4096];
+        int n = _snprintf_s(line, sizeof(line), _TRUNCATE,
+                            "[KOTOR2-BORDERLESS] %s%s\r\n",
+                            consolePrefix, msg);
+        if (n > 0) {
+            HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+            if (hOut != INVALID_HANDLE_VALUE && hOut != NULL) {
+                DWORD written = 0;
+                WriteConsoleA(hOut, line, (DWORD)n, &written, NULL);
+            } else {
+                OutputDebugStringA(line);
+            }
+        }
+    }
 }
 
 static void FileLog(const char* format, ...) {
     va_list args;
     va_start(args, format);
-    FileLogV("", format, args);
+    LogInternal("", nullptr, format, args);
     va_end(args);
-}
-
-static void ConsoleWriteV(const char* format, va_list args) {
-    char buf[2048];
-    const int n = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, format, args);
-    if (n <= 0) return;
-
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut != INVALID_HANDLE_VALUE && hOut != NULL) {
-        DWORD written = 0;
-        WriteConsoleA(hOut, buf, (DWORD)n, &written, NULL);
-    } else {
-        OutputDebugStringA(buf);
-    }
-}
-
-static void ConsoleWriteLine(const char* format, ...) {
-    va_list args;
-    va_start(args, format);
-    ConsoleWriteV(format, args);
-    va_end(args);
-    OutputDebugStringA("\n");
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut != INVALID_HANDLE_VALUE && hOut != NULL) {
-        DWORD written = 0;
-        WriteConsoleA(hOut, "\r\n", 2, &written, NULL);
-    }
 }
 
 static void DebugLog(const char* format, ...) {
     va_list args;
     va_start(args, format);
-    FileLogV("", format, args);
+    LogInternal("", "", format, args);
     va_end(args);
-
-    if (g_enableConsole) {
-        char msg[1900];
-        va_start(args, format);
-        _vsnprintf_s(msg, sizeof(msg), _TRUNCATE, format, args);
-        va_end(args);
-        ConsoleWriteLine("[KOTOR2-BORDERLESS] %s", msg);
-    }
 }
 
 static void WorkerLog(const char* branch, const char* format, ...) {
@@ -360,19 +488,14 @@ static void WorkerLog(const char* branch, const char* format, ...) {
     _snprintf_s(tag, sizeof(tag), _TRUNCATE, "[t:%lu][%s]", GetTickCount(),
                 branch ? branch : "");
 
+    char consolePrefix[128];
+    _snprintf_s(consolePrefix, sizeof(consolePrefix), _TRUNCATE, "t=%lu [%s] ",
+                GetTickCount(), branch ? branch : "");
+
     va_list args;
     va_start(args, format);
-    FileLogV(tag, format, args);
+    LogInternal(tag, consolePrefix, format, args);
     va_end(args);
-
-    if (g_enableConsole) {
-        char msg[1900];
-        va_start(args, format);
-        _vsnprintf_s(msg, sizeof(msg), _TRUNCATE, format, args);
-        va_end(args);
-        ConsoleWriteLine("[KOTOR2-BORDERLESS] t=%lu [%s] %s",
-                         GetTickCount(), branch ? branch : "", msg);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -918,6 +1041,12 @@ static WindowAlignment ParseAlignment(const wchar_t* value) {
     return WindowAlignment::Centered;
 }
 
+static bool GetPrivateProfileBoolW(const wchar_t* appName, const wchar_t* keyName, const wchar_t* defaultVal, const wchar_t* iniPath) {
+    wchar_t buf[16]{};
+    GetPrivateProfileStringW(appName, keyName, defaultVal, buf, 16, iniPath);
+    return ParseIniBool(buf);
+}
+
 static void LoadProxyConfig() {
     if (g_proxyIniPath[0] == L'\0') return;
 
@@ -949,30 +1078,17 @@ static void LoadProxyConfig() {
                              alignBuf, 32, g_proxyIniPath);
     g_alignment = ParseAlignment(alignBuf);
 
-    wchar_t boolBuf[16]{};
-    GetPrivateProfileStringW(L"Borderless", L"HideTaskbar", L"1",
-                             boolBuf, 16, g_proxyIniPath);
-    g_hideTaskbar = ParseIniBool(boolBuf);
-    GetPrivateProfileStringW(L"Borderless", L"ForceWindowed", L"1",
-                             boolBuf, 16, g_proxyIniPath);
-    g_forceWindowed = ParseIniBool(boolBuf);
-    GetPrivateProfileStringW(L"Borderless", L"EnableLog", L"0",
-                             boolBuf, 16, g_proxyIniPath);
-    g_enableLog = ParseIniBool(boolBuf);
-    GetPrivateProfileStringW(L"Borderless", L"EnableConsole", L"0",
-                             boolBuf, 16, g_proxyIniPath);
-    g_enableConsole = ParseIniBool(boolBuf);
-    GetPrivateProfileStringW(L"Borderless", L"SplashScreens", L"1",
-                             boolBuf, 16, g_proxyIniPath);
-    g_showSplashScreens = ParseIniBool(boolBuf);
+    g_hideTaskbar = GetPrivateProfileBoolW(L"Borderless", L"HideTaskbar", L"1", g_proxyIniPath);
+    g_forceWindowed = GetPrivateProfileBoolW(L"Borderless", L"ForceWindowed", L"1", g_proxyIniPath);
+    g_enableLog = GetPrivateProfileBoolW(L"Borderless", L"EnableLog", L"0", g_proxyIniPath);
+    g_enableConsole = GetPrivateProfileBoolW(L"Borderless", L"EnableConsole", L"0", g_proxyIniPath);
+    g_showSplashScreens = GetPrivateProfileBoolW(L"Borderless", L"SplashScreens", L"1", g_proxyIniPath);
 
     int w = (int)GetPrivateProfileIntW(L"Borderless", L"Width",  0, g_proxyIniPath);
     int h = (int)GetPrivateProfileIntW(L"Borderless", L"Height", 0, g_proxyIniPath);
     g_forceWidth  = (w > 0) ? w : 0;
     g_forceHeight = (h > 0) ? h : 0;
-    GetPrivateProfileStringW(L"Borderless", L"StretchViewport", L"1",
-                             boolBuf, 16, g_proxyIniPath);
-    g_stretchViewport = ParseIniBool(boolBuf);
+    g_stretchViewport = GetPrivateProfileBoolW(L"Borderless", L"StretchViewport", L"1", g_proxyIniPath);
 }
 
 // ---------------------------------------------------------------------------
@@ -985,15 +1101,15 @@ static unsigned char g_splashOriginalByte = 0;
 static bool          g_splashPatchApplied = false;
 
 static bool DisableSplashScreens() {
-    void* target = reinterpret_cast<void*>(kPreloadInitialAssetsWrapper);
+    auto* target = reinterpret_cast<unsigned char*>(kPreloadInitialAssetsWrapper);
     DWORD oldProtect = 0;
     if (!VirtualProtect(target, 1, PAGE_EXECUTE_READWRITE, &oldProtect)) {
         DebugLog("Splash skip: VirtualProtect failed (%lu).", GetLastError());
         return false;
     }
 
-    g_splashOriginalByte = *static_cast<unsigned char*>(target);
-    *static_cast<unsigned char*>(target) = 0xC3; // ret
+    g_splashOriginalByte = *target;
+    *target = 0xC3; // ret
 
     DWORD ignored = 0;
     VirtualProtect(target, 1, oldProtect, &ignored);
@@ -1006,10 +1122,10 @@ static bool DisableSplashScreens() {
 static void RestoreSplashScreens() {
     if (!g_splashPatchApplied) return;
 
-    void* target = reinterpret_cast<void*>(kPreloadInitialAssetsWrapper);
+    auto* target = reinterpret_cast<unsigned char*>(kPreloadInitialAssetsWrapper);
     DWORD oldProtect = 0;
     if (VirtualProtect(target, 1, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        *static_cast<unsigned char*>(target) = g_splashOriginalByte;
+        *target = g_splashOriginalByte;
         DWORD ignored = 0;
         VirtualProtect(target, 1, oldProtect, &ignored);
         FlushInstructionCache(GetCurrentProcess(), target, 1);
@@ -1193,8 +1309,24 @@ static bool IsGameGlDrawable() {
     return WindowFromDC(dc) == g_gameHwndForStack;
 }
 
-// Shift viewport/scissor up and extend height by the measured top band (StretchY).
-static void AdjustGlFrameRect(GLint* x, GLint* y, GLsizei* w, GLsizei* h) {
+// Reclaim the phantom top caption band on the engine's MAIN full-frame render.
+//
+// After the borderless pass the engine still reserves ~SM_CYCAPTION pixels of
+// top chrome it no longer has, leaving a thin black band / crop at the top. We
+// pull that main frame up to the client top and grow its height to fill the gap.
+//
+// We must NOT touch the letterboxed dialogue / in-engine cutscene sub-rects.
+// Those use a large vertical offset (a centered cinematic band), and the engine
+// pairs viewport and scissor rects that have to stay in sync. The old code
+// rewrote every offset rect (forcing y=0 and extending height), which desynced
+// the cinematic viewport from its scissor box: the 3D world got scissored away
+// and rendered solid black while the separately-drawn subtitle/UI pass still
+// showed. So we only adjust a rect that is (near) full client width AND covers
+// the full client height to within the measured band - i.e. the real main frame
+// - and pass everything else (cinematics, HUD sub-rects, scissor crops) through
+// exactly as the engine set it.
+static void AdjustGlFrameRect(GLint* /*x*/, GLint* y, GLsizei* w, GLsizei* h) {
+    if (!g_stretchViewport || g_glTopBand <= 0) return;
     if (!IsGameGlDrawable()) return;
 
     RECT cr{};
@@ -1203,24 +1335,51 @@ static void AdjustGlFrameRect(GLint* x, GLint* y, GLsizei* w, GLsizei* h) {
     const int clientH = cr.bottom - cr.top;
     if (clientW <= 0 || clientH <= 0) return;
 
-    // Only adjust large main-frame rects; skip tiny UI/icon viewports.
-    if (*w < (GLsizei)((clientW * 3) / 4) && *h < (GLsizei)((clientH * 3) / 4))
-        return;
-
     const int band = g_glTopBand;
+    const int w0   = (int)*w;
+    const int h0   = (int)*h;
+    const int y0   = (int)*y;
+    if (w0 <= 0 || h0 <= 0) return;
 
-    if (*y > 0) {
-        const int expanded = (int)*h + (int)*y;
+    // Tolerance for matching the main frame against the chrome band. Letterbox
+    // cinematic bars are far taller than this, so they never qualify.
+    const int slack = band + 8;
+
+    const bool nearFullWidth    = w0 >= clientW - 8;
+    const bool smallTopOffset   = y0 >= 0 && y0 <= slack;
+    const bool coversFullHeight = (y0 + h0) >= clientH - slack;
+
+    // Only the main near-full-screen frame is corrected; anything else is left
+    // untouched so cinematic viewport/scissor pairs stay consistent.
+    if (!(nearFullWidth && smallTopOffset && coversFullHeight)) return;
+
+    if (y0 > 0) {
+        const int expanded = h0 + y0;
         *h = (GLsizei)(expanded > clientH ? clientH : expanded);
         *y = 0;
     }
-
-    if ((int)*h > 0) {
+    if ((int)*h < clientH) {
         const int stretched = (int)*h + band;
-        if (stretched <= clientH) {
-            *h = (GLsizei)stretched;
-        } else if ((int)*h < clientH) {
-            *h = (GLsizei)clientH;
+        *h = (GLsizei)(stretched > clientH ? clientH : stretched);
+    }
+}
+
+static void ScaleForShrunkEngine(GLint* x, GLint* y, GLsizei* w, GLsizei* h) {
+    const int shrunkW = g_engineShrunkW.load();
+    const int shrunkH = g_engineShrunkH.load();
+    if (shrunkW <= 0 || shrunkH <= 0) return;
+
+    RECT cr{};
+    if (g_gameHwndForStack && GetClientRect(g_gameHwndForStack, &cr)) {
+        const int clientW = cr.right  - cr.left;
+        const int clientH = cr.bottom - cr.top;
+        if (clientW > 0 && clientH > 0) {
+            const double scaleX = (double)clientW / shrunkW;
+            const double scaleY = (double)clientH / shrunkH;
+            *x = (GLint)(*x * scaleX);
+            *y = (GLint)(*y * scaleY);
+            *w = (GLsizei)(*w * scaleX);
+            *h = (GLsizei)(*h * scaleY);
         }
     }
 }
@@ -1228,7 +1387,11 @@ static void AdjustGlFrameRect(GLint* x, GLint* y, GLsizei* w, GLsizei* h) {
 static void __stdcall Hook_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
     GLint ax = x, ay = y;
     GLsizei aw = width, ah = height;
-    AdjustGlFrameRect(&ax, &ay, &aw, &ah);
+    if (g_engineShrunkW.load() > 0 && g_engineShrunkH.load() > 0) {
+        ScaleForShrunkEngine(&ax, &ay, &aw, &ah);
+    } else {
+        AdjustGlFrameRect(&ax, &ay, &aw, &ah);
+    }
     if (g_realGlViewport) {
         g_realGlViewport(ax, ay, aw, ah);
     }
@@ -1237,7 +1400,11 @@ static void __stdcall Hook_glViewport(GLint x, GLint y, GLsizei width, GLsizei h
 static void __stdcall Hook_glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
     GLint ax = x, ay = y;
     GLsizei aw = width, ah = height;
-    AdjustGlFrameRect(&ax, &ay, &aw, &ah);
+    if (g_engineShrunkW.load() > 0 && g_engineShrunkH.load() > 0) {
+        ScaleForShrunkEngine(&ax, &ay, &aw, &ah);
+    } else {
+        AdjustGlFrameRect(&ax, &ay, &aw, &ah);
+    }
     if (g_realGlScissor) {
         g_realGlScissor(ax, ay, aw, ah);
     }
@@ -1246,14 +1413,14 @@ static void __stdcall Hook_glScissor(GLint x, GLint y, GLsizei width, GLsizei he
 static bool InstallDetour5Byte(void* target, void* hook, void** trampolineOut) {
     if (!target || !hook || !trampolineOut) return false;
 
-    BYTE* const t = (BYTE*)target;
-    void* const tramp = VirtualAlloc(nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    auto* const t = reinterpret_cast<BYTE*>(target);
+    auto* const tramp = VirtualAlloc(nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!tramp) return false;
 
     memcpy(tramp, t, 5);
-    BYTE* const jmpBack = (BYTE*)tramp + 5;
+    auto* const jmpBack = reinterpret_cast<BYTE*>(tramp) + 5;
     jmpBack[0] = 0xE9;
-    *(DWORD*)(jmpBack + 1) = (DWORD)(t + 5) - (DWORD)(jmpBack + 5);
+    *reinterpret_cast<DWORD*>(jmpBack + 1) = static_cast<DWORD>(reinterpret_cast<DWORD_PTR>(t + 5) - reinterpret_cast<DWORD_PTR>(jmpBack + 5));
 
     DWORD oldProt = 0;
     if (!VirtualProtect(t, 5, PAGE_EXECUTE_READWRITE, &oldProt)) {
@@ -1262,7 +1429,7 @@ static bool InstallDetour5Byte(void* target, void* hook, void** trampolineOut) {
     }
 
     t[0] = 0xE9;
-    *(DWORD*)(t + 1) = (DWORD)hook - (DWORD)(t + 5);
+    *reinterpret_cast<DWORD*>(t + 1) = static_cast<DWORD>(reinterpret_cast<DWORD_PTR>(hook) - reinterpret_cast<DWORD_PTR>(t + 5));
     VirtualProtect(t, 5, oldProt, &oldProt);
     FlushInstructionCache(GetCurrentProcess(), t, 5);
 
@@ -1271,7 +1438,7 @@ static bool InstallDetour5Byte(void* target, void* hook, void** trampolineOut) {
 }
 
 static bool InstallOpenGLViewportHooks(int topBand) {
-    if (topBand <= 0 || g_mode == BorderlessMode::Windowed || !g_stretchViewport)
+    if (g_mode == BorderlessMode::Windowed)
         return false;
     if (g_glHooksInstalled.load()) return true;
 
@@ -1418,30 +1585,18 @@ static HWND CreateTaskbarShieldWindow() {
 // Borderless worker.
 // ---------------------------------------------------------------------------
 static bool IsExcludedTopLevelWindow(HWND hwnd) {
-    char cls[64]{};
-    if (GetClassNameA(hwnd, cls, (int)sizeof(cls)) == 0) return false;
+    wchar_t cls[64]{};
+    if (GetClassNameW(hwnd, cls, sizeof(cls) / sizeof(wchar_t)) == 0) return false;
     // Things we created ourselves; never let them become the cached "game" window.
-    if (_stricmp(cls, "ConsoleWindowClass") == 0) return true;
-    if (_stricmp(cls, "KOTOR2BorderlessBackdrop") == 0) return true;
-    if (_stricmp(cls, "KOTOR2BorderlessTaskbarShield") == 0) return true;
+    if (_wcsicmp(cls, L"ConsoleWindowClass") == 0) return true;
+    if (_wcsicmp(cls, kBackdropClassName) == 0) return true;
+    if (_wcsicmp(cls, kTaskbarShieldClassName) == 0) return true;
     return false;
 }
 
 // Convert desired client size to outer-window size and position on the monitor.
 // SetWindowPos expects outer dimensions; client size must match the GL viewport.
-static void ComputeAlignedPlacement(
-    int desiredClientW, int desiredClientH,
-    LONG style, LONG exStyle,
-    WindowAlignment align,
-    int* outX, int* outY, int* outOuterW, int* outOuterH)
-{
-    RECT rc{ 0, 0, desiredClientW, desiredClientH };
-    AdjustWindowRectEx(&rc, style, FALSE, exStyle);
-    const int outerW = rc.right  - rc.left;
-    const int outerH = rc.bottom - rc.top;
-    *outOuterW = outerW;
-    *outOuterH = outerH;
-
+static void ComputeOuterCoords(int outerW, int outerH, WindowAlignment align, int* outX, int* outY) {
     int x = g_monitorX;
     int y = g_monitorY;
     switch (align) {
@@ -1481,6 +1636,22 @@ static void ComputeAlignedPlacement(
     *outY = y;
 }
 
+static void ComputeAlignedPlacement(
+    int desiredClientW, int desiredClientH,
+    LONG style, LONG exStyle,
+    WindowAlignment align,
+    int* outX, int* outY, int* outOuterW, int* outOuterH)
+{
+    RECT rc{ 0, 0, desiredClientW, desiredClientH };
+    AdjustWindowRectEx(&rc, style, FALSE, exStyle);
+    const int outerW = rc.right  - rc.left;
+    const int outerH = rc.bottom - rc.top;
+    *outOuterW = outerW;
+    *outOuterH = outerH;
+
+    ComputeOuterCoords(outerW, outerH, align, outX, outY);
+}
+
 // Nudge the window so its outer rect matches the chosen alignment (used after
 // SetWindowLong / z-order calls, which can shift the frame by a few pixels).
 static void ApplyAlignmentToWindow(HWND hwnd, WindowAlignment align) {
@@ -1489,41 +1660,8 @@ static void ApplyAlignmentToWindow(HWND hwnd, WindowAlignment align) {
     const int outerW = wr.right  - wr.left;
     const int outerH = wr.bottom - wr.top;
 
-    int x = g_monitorX;
-    int y = g_monitorY;
-    switch (align) {
-    case WindowAlignment::TopLeft:
-        break;
-    case WindowAlignment::TopRight:
-        x += g_monitorWidth - outerW;
-        break;
-    case WindowAlignment::BottomLeft:
-        y += g_monitorHeight - outerH;
-        break;
-    case WindowAlignment::BottomRight:
-        x += g_monitorWidth - outerW;
-        y += g_monitorHeight - outerH;
-        break;
-    case WindowAlignment::Top:
-        x += (g_monitorWidth - outerW) / 2;
-        break;
-    case WindowAlignment::Bottom:
-        x += (g_monitorWidth - outerW) / 2;
-        y += g_monitorHeight - outerH;
-        break;
-    case WindowAlignment::Left:
-        y += (g_monitorHeight - outerH) / 2;
-        break;
-    case WindowAlignment::Right:
-        x += g_monitorWidth - outerW;
-        y += (g_monitorHeight - outerH) / 2;
-        break;
-    case WindowAlignment::Centered:
-    default:
-        x += (g_monitorWidth  - outerW) / 2;
-        y += (g_monitorHeight - outerH) / 2;
-        break;
-    }
+    int x = 0, y = 0;
+    ComputeOuterCoords(outerW, outerH, align, &x, &y);
 
     if (wr.left != x || wr.top != y) {
         SetWindowPos(hwnd, NULL, x, y, 0, 0,
@@ -1531,8 +1669,65 @@ static void ApplyAlignmentToWindow(HWND hwnd, WindowAlignment align) {
     }
 }
 
+// The engine shrinks the HWND for Bink FMV (often 640x480). Re-apply our target
+// client size so Fill/NoFill keeps the configured render resolution.
+static void RestoreGameClientLayoutIfNeeded() {
+    if (!g_targetLayoutSaved.load() || g_inLayoutRestore.load()) return;
+    if (!g_gameHwndForStack || !IsWindow(g_gameHwndForStack)) return;
+    if (IsIconic(g_gameHwndForStack)) {
+        if (!IsEngineFmvActive()) return;
+        ShowWindow(g_gameHwndForStack, SW_RESTORE);
+    }
+    if (g_mode == BorderlessMode::Windowed) return;
+    if (g_targetClientW <= 0 || g_targetClientH <= 0) return;
+    if (!IsGameSessionActive()) return;
+
+    RECT cr{};
+    if (!GetClientRect(g_gameHwndForStack, &cr)) return;
+    const int cw = cr.right  - cr.left;
+    const int ch = cr.bottom - cr.top;
+    constexpr int kShrinkSlack = 48;
+    if (cw >= g_targetClientW - kShrinkSlack && ch >= g_targetClientH - kShrinkSlack) {
+        g_engineShrunkW.store(0);
+        g_engineShrunkH.store(0);
+        return;
+    }
+
+    static DWORD s_lastRestoreMs = 0;
+    const DWORD now = GetTickCount();
+    if (now - s_lastRestoreMs < 100) return;
+    s_lastRestoreMs = now;
+
+    g_inLayoutRestore.store(true);
+    g_engineShrunkW.store(cw);
+    g_engineShrunkH.store(ch);
+    g_lastFmvShrinkMs.store(GetTickCount());
+
+    int targetX = 0, targetY = 0, targetOuterW = 0, targetOuterH = 0;
+    ComputeAlignedPlacement(g_targetClientW, g_targetClientH,
+                            g_targetPopupStyle, g_targetPopupExStyle,
+                            g_targetPlacement,
+                            &targetX, &targetY, &targetOuterW, &targetOuterH);
+
+    SetWindowLongW(g_gameHwndForStack, GWL_STYLE,   g_targetPopupStyle);
+    SetWindowLongW(g_gameHwndForStack, GWL_EXSTYLE, g_targetPopupExStyle);
+
+    SetWindowPos(g_gameHwndForStack, NULL,
+                 targetX, targetY, targetOuterW, targetOuterH,
+                 SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+
+    ApplyDwmClientBleed(g_gameHwndForStack);
+    ApplyAlignmentToWindow(g_gameHwndForStack, g_targetPlacement);
+
+    WorkerLog("layout", "FMV shrink %dx%d -> restore target %dx%d",
+              cw, ch, g_targetClientW, g_targetClientH);
+
+    g_inLayoutRestore.store(false);
+    UpdateFillBackdropForSession();
+}
+
 static BOOL CALLBACK FindGameWindowCallback(HWND hwnd, LPARAM lParam) {
-    TargetWindowData& data = *(TargetWindowData*)lParam;
+    auto& data = *reinterpret_cast<TargetWindowData*>(lParam);
     DWORD windowProcessId = 0;
     GetWindowThreadProcessId(hwnd, &windowProcessId);
 
@@ -1573,7 +1768,7 @@ static DWORD WINAPI BorderlessWorker(LPVOID /*lpParam*/) {
     for (int tick = 0; tick < kMaxScanTicks; tick++) {
         data.hwnd     = NULL;
         data.bestArea = 0;
-        EnumWindows(FindGameWindowCallback, (LPARAM)&data);
+        EnumWindows(FindGameWindowCallback, reinterpret_cast<LPARAM>(&data));
         if (data.hwnd) { gameHwnd = data.hwnd; break; }
         Sleep(kPollMs);
     }
@@ -1652,8 +1847,29 @@ static DWORD WINAPI BorderlessWorker(LPVOID /*lpParam*/) {
     ComputeDesiredClientSize(cw, ch, style, exStyle, popupStyle, popupExStyle,
                              &desiredClientW, &desiredClientH);
 
-    const int topBand = MeasureTopChromeBandPx(style, exStyle);
-    if (topBand > 0) {
+    int topBand = MeasureTopChromeBandPx(style, exStyle);
+
+    // When the game runs below display resolution it is letterboxed (centered
+    // with black borders in Fill mode). ComputeDesiredClientSize adds reclaimH
+    // (~34 px of stripped chrome) to the client. The engine's GL viewport still
+    // covers only the original render resolution, leaving a gap at the client
+    // top. The engine maps mouse coordinates directly from client coordinates
+    // (client_y=0 = top of client, NOT top of the render), so every click
+    // registers above its visual position by exactly the gap size. Fix: when
+    // sub-native, reset the client to the engine's actual render resolution
+    // (cw/ch) so client and render are 1:1, and also zero topBand so the GL
+    // viewport correction is skipped (it would shift/stretch the render away
+    // from the 1:1 layout). For native res (fillsMonitor), keep the existing
+    // reclaimH + topBand behaviour so the top chrome strip is reclaimed.
+    const int kFillSlack = 2;
+    const bool fillsMonitor =
+        desiredClientW >= g_monitorWidth  - kFillSlack &&
+        desiredClientH >= g_monitorHeight - kFillSlack;
+    if (!fillsMonitor) {
+        desiredClientW = cw;
+        desiredClientH = ch;
+        topBand = 0;
+    } else if (topBand > 0) {
         const int expandedH = desiredClientH + topBand;
         if (expandedH <= g_monitorHeight) {
             desiredClientH = expandedH;
@@ -1709,14 +1925,18 @@ static DWORD WINAPI BorderlessWorker(LPVOID /*lpParam*/) {
                   actualW, actualH, desiredClientW, desiredClientH);
     }
 
-    if (g_stretchViewport && topBand > 0) {
-        if (InstallOpenGLViewportHooks(topBand)) {
-            WorkerLog("glhook", "glViewport/glScissor hooks active (topBand=%d).",
-                      topBand);
-        } else {
-            WorkerLog("glhook", "failed to install OpenGL hooks (topBand=%d).",
-                      topBand);
-        }
+    g_targetClientW      = actualW > 0 ? actualW : desiredClientW;
+    g_targetClientH      = actualH > 0 ? actualH : desiredClientH;
+    g_targetPlacement    = placement;
+    g_targetPopupStyle   = popupStyle;
+    g_targetPopupExStyle = popupExStyle;
+    g_targetLayoutSaved.store(true);
+
+    if (InstallOpenGLViewportHooks(topBand)) {
+        WorkerLog("glhook", "glViewport/glScissor hooks active (topBand=%d, stretch=%d).",
+                  topBand, (int)g_stretchViewport);
+    } else {
+        WorkerLog("glhook", "failed to install OpenGL hooks.");
     }
 
     static HWINEVENTHOOK layoutHook = NULL;
@@ -1724,7 +1944,7 @@ static DWORD WINAPI BorderlessWorker(LPVOID /*lpParam*/) {
         RestackFillAfterGameLayoutChange();
     }
 
-    if (!layoutHook && (g_backdropHwnd || UsesFocusZOrder())) {
+    if (!layoutHook && g_targetLayoutSaved.load()) {
         layoutHook = SetWinEventHook(
             EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
             NULL, GameWindowLayoutCallback, 0, 0,
@@ -1737,12 +1957,21 @@ static DWORD WINAPI BorderlessWorker(LPVOID /*lpParam*/) {
     }
 
     static HWINEVENTHOOK foregroundHook = NULL;
-    if (!foregroundHook && UsesFocusZOrder()) {
+    static HWINEVENTHOOK minimizeHook = NULL;
+    // Fill: backdrop stacking on layout; HideTaskbar/NoFill need z-order on foreground.
+    if (!foregroundHook
+        && (UsesFocusZOrder() || g_mode == BorderlessMode::Fill)) {
         SetBreadcrumb("BorderlessWorker: installing foreground hook");
         foregroundHook = SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
             NULL, ForegroundStackCallback, 0, 0,
             WINEVENT_OUTOFCONTEXT);
+        if (UsesFocusZOrder()) {
+            minimizeHook = SetWinEventHook(
+                EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZESTART,
+                NULL, MinimizeStackCallback, 0, 0,
+                WINEVENT_OUTOFCONTEXT);
+        }
     }
 
     SetBreadcrumb("BorderlessWorker: before SetGameFocusZOrder");
@@ -1751,8 +1980,8 @@ static DWORD WINAPI BorderlessWorker(LPVOID /*lpParam*/) {
     WorkerLog("done", "apply complete; transitioning to message pump.");
     SetBreadcrumb("BorderlessWorker: before GetMessage");
 
-    // Phase 4: message pump for the foreground hook and backdrop repaints.
-    // We never touch the game window again from here on.
+    // Phase 4: message pump for hooks. FMV may shrink the HWND; the layout hook
+    // restores our saved client size (see RestoreGameClientLayoutIfNeeded).
     if (g_backdropHwnd || UsesFocusZOrder()) {
         MSG msg;
         bool firstDispatch = true;
